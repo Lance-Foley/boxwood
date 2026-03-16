@@ -131,14 +131,14 @@ EOF
 launch_tmux() {
   local session_name="$1" worktree_path="$2" port="$3"
 
+  # Open RubyMine (always, even on resume)
+  open -a "RubyMine" "$worktree_path" 2>/dev/null &
+
   # Resume existing tmux session if it exists
   if tmux has-session -t "$session_name" 2>/dev/null; then
     info "Reattaching to tmux session: $session_name"
     exec tmux attach -t "$session_name"
   fi
-
-  # Open RubyMine
-  open -a "RubyMine" "$worktree_path" 2>/dev/null &
 
   # Create tmux session with split panes
   info "Starting tmux session: $session_name"
@@ -218,12 +218,12 @@ cmd_attach() {
     local db_name="wescomapp_dev_${dir_name//-/_}"
     db_name="${db_name:0:63}"
     if db_exists "$db_name"; then
-      if confirm "Database '$db_name' exists. Reuse it?"; then
-        info "Reusing existing database"
-      else
+      if confirm "Database '$db_name' exists. Drop and re-clone?"; then
         info "Fresh clone requested"
         db_drop "$db_name"
         db_clone "$db_name" || exit 1
+      else
+        info "Reusing existing database"
       fi
     else
       info "Database not found — creating fresh clone"
@@ -239,6 +239,7 @@ cmd_attach() {
     fi
 
     launch_tmux "$tmux_session" "$worktree_path" "$port"
+    exit 0  # Safety: should not reach here (launch_tmux uses exec)
   fi
 
   # New session — create worktree, DB, env, memory
