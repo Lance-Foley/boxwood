@@ -118,6 +118,13 @@ about this work. Store session notes, decision logs, and progress
 updates in .session/memory/ so they persist across conversations.
 EOF
 
+  # Remove Solid Queue Puma plugin (causes macOS fork crash in worktrees)
+  local puma_rb="$worktree_path/config/puma.rb"
+  if [[ -f "$puma_rb" ]] && grep -q "plugin :solid_queue" "$puma_rb"; then
+    sed -i '' '/plugin :solid_queue/d' "$puma_rb"
+    success "Patched puma.rb: removed Solid Queue plugin"
+  fi
+
   # Git excludes so session files don't show as dirty
   # Worktrees use a .git file (not directory), so resolve the real git dir
   local git_dir
