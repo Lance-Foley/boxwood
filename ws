@@ -78,7 +78,7 @@ next_port() {
 find_session_by_cwd() {
   local cwd="$1"
   jq -r --arg cwd "$cwd" '
-    .[] | select(.status == "active" and ($cwd | startswith(.path))) | .branch
+    .[] | select(.status == "active" and ((.path // .worktree_path // "") as $p | $p != "" and ($cwd | startswith($p)))) | .branch
   ' "$SESSIONS_FILE" | head -1
 }
 
@@ -200,10 +200,10 @@ cmd_attach() {
   local worktree_path="$SESSIONS_DIR/$dir_name"
   local tmux_session="ws-$dir_name"
 
-  # Check for slug collision with different branch
+  # Check for slug collision with different branch (guard against null .path from old entries)
   local existing_branch
   existing_branch=$(jq -r --arg d "$dir_name" --arg b "$branch" \
-    '.[] | select(.status == "active" and (.path | endswith("/"+$d)) and .branch != $b) | .branch' \
+    '.[] | select(.status == "active" and .branch != $b and ((.path // .worktree_path // "") | endswith("/"+$d))) | .branch' \
     "$SESSIONS_FILE" | head -1)
   if [[ -n "$existing_branch" ]]; then
     error "Directory name '$dir_name' is already used by branch '$existing_branch'."
@@ -292,7 +292,7 @@ cmd_list() {
   printf "  ${BOLD}%-30s %-40s %-6s %s${NC}\n" "BRANCH" "DATABASE" "PORT" "STARTED"
   echo "  $(printf '%.0s─' {1..90})"
 
-  echo "$active" | jq -r '.[] | "\(.branch)\t\(.db)\t\(.port)\t\(.started)"' |
+  echo "$active" | jq -r '.[] | "\(.branch)\t\(.db // .db_name // "?")\t\(.port // "?")\t\(.started)"' |
   while IFS=$'\t' read -r branch db port started; do
     printf "  %-30s %-40s %-6s %s\n" "${branch:0:28}" "${db:0:38}" "$port" "$started"
   done
@@ -303,7 +303,7 @@ cmd_list() {
   if [[ -n "$session_dbs" ]]; then
     local orphaned=""
     while IFS= read -r db; do
-      if ! echo "$active" | jq -e --arg db "$db" '.[] | select(.db == $db)' > /dev/null 2>&1; then
+      if ! echo "$active" | jq -e --arg db "$db" '.[] | select((.db // .db_name) == $db)' > /dev/null 2>&1; then
         orphaned+="  $db\n"
       fi
     done <<< "$session_dbs"
@@ -323,7 +323,8 @@ cmd_end() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --branch) branch="$2"; shift 2 ;;
-      *)        error "Unknown argument: $1"; exit 1 ;;
+      -*)       error "Unknown option: $1"; exit 1 ;;
+      *)        branch="$1"; shift ;;  # positional: ws end <branch>
     esac
   done
 
@@ -344,8 +345,8 @@ cmd_end() {
   fi
 
   local db_name worktree_path
-  db_name=$(echo "$session" | jq -r '.db')
-  worktree_path=$(echo "$session" | jq -r '.path')
+  db_name=$(echo "$session" | jq -r '.db // .db_name')
+  worktree_path=$(echo "$session" | jq -r '.path // .worktree_path')
 
   header "Ending session: $branch"
 
