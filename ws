@@ -273,6 +273,124 @@ cmd_attach() {
   launch_tmux "$tmux_session" "$worktree_path" "$port"
 }
 
+# ─── ws list ────────────────────────────────────────────────────────────────
+
+cmd_list() {
+  header "Active Sessions"
+
+  local active
+  active=$(jq '[.[] | select(.status == "active")]' "$SESSIONS_FILE")
+  local count
+  count=$(echo "$active" | jq 'length')
+
+  if [[ "$count" == "0" ]]; then
+    dim "  No active sessions."
+    return
+  fi
+
+  printf "  ${BOLD}%-30s %-40s %-6s %s${NC}\n" "BRANCH" "DATABASE" "PORT" "STARTED"
+  echo "  $(printf '%.0s─' {1..90})"
+
+  echo "$active" | jq -r '.[] | "\(.branch)\t\(.db)\t\(.port)\t\(.started)"' |
+  while IFS=$'\t' read -r branch db port started; do
+    printf "  %-30s %-40s %-6s %s\n" "${branch:0:28}" "${db:0:38}" "$port" "$started"
+  done
+
+  # Check for orphaned databases
+  local session_dbs
+  session_dbs=$(db_list_session_dbs)
+  if [[ -n "$session_dbs" ]]; then
+    local orphaned=""
+    while IFS= read -r db; do
+      if ! echo "$active" | jq -e --arg db "$db" '.[] | select(.db == $db)' > /dev/null 2>&1; then
+        orphaned+="  $db\n"
+      fi
+    done <<< "$session_dbs"
+    if [[ -n "$orphaned" ]]; then
+      echo ""
+      warn "Orphaned databases (no active session):"
+      echo -e "$orphaned"
+    fi
+  fi
+}
+
+# ─── ws end ─────────────────────────────────────────────────────────────────
+
+cmd_end() {
+  local branch=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --branch) branch="$2"; shift 2 ;;
+      *)        error "Unknown argument: $1"; exit 1 ;;
+    esac
+  done
+
+  # Detect from cwd if no branch specified
+  if [[ -z "$branch" ]]; then
+    branch=$(find_session_by_cwd "$(pwd)")
+    if [[ -z "$branch" ]]; then
+      error "Not in a session directory. Use --branch <name>."
+      exit 1
+    fi
+  fi
+
+  local session
+  session=$(jq --arg b "$branch" '.[] | select(.branch == $b and .status == "active")' "$SESSIONS_FILE")
+  if [[ -z "$session" ]]; then
+    error "No active session for branch: $branch"
+    exit 1
+  fi
+
+  local db_name worktree_path
+  db_name=$(echo "$session" | jq -r '.db')
+  worktree_path=$(echo "$session" | jq -r '.path')
+
+  header "Ending session: $branch"
+
+  # Show git status
+  if [[ -d "$worktree_path" ]]; then
+    local ahead
+    ahead=$(git -C "$worktree_path" rev-list --count main..HEAD 2>/dev/null || echo "0")
+    local dirty
+    dirty=$(git -C "$worktree_path" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+    info "Commits ahead of main: $ahead"
+    info "Uncommitted files: $dirty"
+    echo ""
+  fi
+
+  # Push
+  if confirm "Push branch to origin?"; then
+    git -C "$worktree_path" push -u origin "$branch" 2>/dev/null && success "Branch pushed" || warn "Push failed"
+    echo ""
+  fi
+
+  # Drop DB
+  if confirm "Drop database ($db_name)?"; then
+    db_drop "$db_name"
+    echo ""
+  fi
+
+  # Remove worktree
+  if confirm "Remove worktree ($worktree_path)?"; then
+    if [[ "$(pwd)" == "$worktree_path"* ]]; then
+      cd "$HOME"
+    fi
+    git -C "$WESCOM_APP_PATH" worktree remove --force "$worktree_path" 2>/dev/null
+    git -C "$WESCOM_APP_PATH" worktree prune 2>/dev/null
+    success "Worktree removed"
+    echo ""
+  fi
+
+  # Mark ended in registry BEFORE killing tmux (in case we're running inside it)
+  registry_end "$branch"
+  success "Session ended: $branch"
+
+  # Kill tmux (may terminate our own shell if running inside the session)
+  local tmux_session="ws-$(slugify "$branch")"
+  tmux kill-session -t "$tmux_session" 2>/dev/null && success "Tmux session killed" || true
+}
+
 # ─── Usage ──────────────────────────────────────────────────────────────────
 
 usage() {
