@@ -149,7 +149,129 @@ launch_tmux() {
   exec tmux attach -t "$session_name"
 }
 
-# ─── Commands (cmd_attach, cmd_list, cmd_end will be added later) ────────────
+# ─── ws attach ──────────────────────────────────────────────────────────────
+
+cmd_attach() {
+  local branch="" pr_number="" new_name=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --pr)     pr_number="$2"; shift 2 ;;
+      --branch) branch="$2"; shift 2 ;;
+      --new)    new_name="$2"; shift 2 ;;
+      *)        error "Unknown argument: $1"; usage; exit 1 ;;
+    esac
+  done
+
+  # Validate: exactly one mode
+  local modes=0
+  [[ -n "$pr_number" ]] && modes=$((modes + 1))
+  [[ -n "$branch" ]] && modes=$((modes + 1))
+  [[ -n "$new_name" ]] && modes=$((modes + 1))
+  if [[ "$modes" -ne 1 ]]; then
+    error "Provide exactly one of --pr, --branch, or --new."
+    usage
+    exit 1
+  fi
+
+  registry_prune
+
+  # Resolve branch from PR (run gh from inside repo so it detects the remote)
+  if [[ -n "$pr_number" ]]; then
+    info "Resolving branch from PR #${pr_number}..."
+    local pr_json
+    pr_json=$(cd "$WESCOM_APP_PATH" && gh pr view "$pr_number" --json headRefName 2>/dev/null) || {
+      error "PR #${pr_number} not found. Check the number and your gh auth status."
+      exit 1
+    }
+    branch=$(echo "$pr_json" | jq -r '.headRefName')
+    success "PR #${pr_number} → branch: $branch"
+  fi
+
+  # Create new branch (fetch first so origin/main is current)
+  if [[ -n "$new_name" ]]; then
+    branch=$(slugify "$new_name")
+    info "Creating new branch: $branch"
+    git -C "$WESCOM_APP_PATH" fetch origin
+  fi
+
+  local dir_name
+  dir_name=$(slugify "$branch")
+  local worktree_path="$SESSIONS_DIR/$dir_name"
+  local tmux_session="ws-$dir_name"
+
+  # Check for slug collision with different branch
+  local existing_branch
+  existing_branch=$(jq -r --arg d "$dir_name" --arg b "$branch" \
+    '.[] | select(.status == "active" and (.path | endswith("/"+$d)) and .branch != $b) | .branch' \
+    "$SESSIONS_FILE" | head -1)
+  if [[ -n "$existing_branch" ]]; then
+    error "Directory name '$dir_name' is already used by branch '$existing_branch'."
+    exit 1
+  fi
+
+  # Resume existing session
+  if [[ -d "$worktree_path" ]]; then
+    info "Existing worktree found at $worktree_path"
+
+    # Handle database: check if it exists
+    local db_name="wescomapp_dev_${dir_name//-/_}"
+    db_name="${db_name:0:63}"
+    if db_exists "$db_name"; then
+      if confirm "Database '$db_name' exists. Reuse it?"; then
+        info "Reusing existing database"
+      else
+        info "Fresh clone requested"
+        db_drop "$db_name"
+        db_clone "$db_name" || exit 1
+      fi
+    else
+      info "Database not found — creating fresh clone"
+      db_clone "$db_name" || exit 1
+    fi
+
+    # Get port from registry or assign new one
+    local port
+    port=$(jq -r --arg b "$branch" '.[] | select(.branch == $b and .status == "active") | .port' "$SESSIONS_FILE" | head -1)
+    if [[ -z "$port" || "$port" == "null" ]]; then
+      port=$(next_port) || exit 1
+      registry_add "$branch" "$db_name" "$port" "$worktree_path" "${pr_number:-null}"
+    fi
+
+    launch_tmux "$tmux_session" "$worktree_path" "$port"
+  fi
+
+  # New session — create worktree, DB, env, memory
+  info "Creating session for branch: $branch"
+  git -C "$WESCOM_APP_PATH" fetch origin
+
+  if [[ -n "$new_name" ]]; then
+    # Branch off origin/main without mutating the main repo's checkout
+    git -C "$WESCOM_APP_PATH" worktree add -b "$branch" "$worktree_path" origin/main
+  else
+    git -C "$WESCOM_APP_PATH" worktree add "$worktree_path" "origin/$branch"
+  fi
+  success "Worktree created at $worktree_path"
+
+  local db_name="wescomapp_dev_${dir_name//-/_}"
+  db_name="${db_name:0:63}"
+  db_clone "$db_name" || exit 1
+
+  local port
+  port=$(next_port) || exit 1
+
+  setup_session "$worktree_path" "$db_name" "$port" "$branch" "${pr_number:-}"
+  registry_add "$branch" "$db_name" "$port" "$worktree_path" "${pr_number:-null}"
+
+  header "Session Ready"
+  echo -e "  ${BOLD}Branch:${NC}    $branch"
+  echo -e "  ${BOLD}Database:${NC}  $db_name"
+  echo -e "  ${BOLD}Port:${NC}      $port"
+  echo -e "  ${BOLD}Path:${NC}      $worktree_path"
+  echo ""
+
+  launch_tmux "$tmux_session" "$worktree_path" "$port"
+}
 
 # ─── Usage ──────────────────────────────────────────────────────────────────
 
