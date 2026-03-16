@@ -152,7 +152,7 @@ launch_tmux() {
   tmux new-session -d -s "$session_name" -c "$worktree_path"
   tmux send-keys -t "$session_name" "PORT=$port bin/dev" Enter
   tmux split-window -h -t "$session_name" -c "$worktree_path"
-  tmux send-keys -t "$session_name" "claude" Enter
+  tmux send-keys -t "$session_name" "claude --dangerously-skip-permissions" Enter
   exec tmux attach -t "$session_name"
 }
 
