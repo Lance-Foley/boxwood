@@ -14,6 +14,7 @@ services:
 
   app:
     image: wescomapp-dev:latest
+    command: bundle exec puma -C config/puma.rb -b tcp://0.0.0.0:3000
     environment:
       DATABASE_URL: postgres://postgres@db/wescomapp
       SOLID_QUEUE_IN_PUMA: "false"
@@ -31,6 +32,15 @@ services:
         condition: service_healthy
     env_file:
       - __WORKTREE_PATH__/.env
+
+  css:
+    image: wescomapp-dev:latest
+    command: bundle exec rails tailwindcss:watch
+    volumes:
+      - __WORKTREE_PATH__:/app
+      - bundle_cache:/usr/local/bundle
+      - node_cache:/app/node_modules
+    restart: unless-stopped
 
   worker:
     image: wescomapp-dev:latest
