@@ -99,31 +99,24 @@ compose_up() {
 
   if [[ "$state" == "first_run" ]]; then
     info "Waiting for database initialization (restore + migrate + password reset)..."
-    # Follow app logs until "Database ready." appears, with 5-minute timeout.
-    # Run log-following in a background process so we can kill it on timeout.
-    local log_pid
-    docker compose -p "$project" logs -f app 2>&1 | while IFS= read -r line; do
-      echo "  $line"
-      if [[ "$line" == *"Database ready."* ]]; then
+    # Poll app logs every 2 seconds until "Database ready." appears (5 min timeout)
+    local waited=0
+    while [[ $waited -lt 300 ]]; do
+      if docker compose -p "$project" logs app 2>&1 | grep -q "Database ready."; then
+        # Print the init logs for visibility
+        docker compose -p "$project" logs app 2>&1 | grep "^app-1  | ==>"
+        success "Database initialized"
         break
       fi
-    done &
-    log_pid=$!
-
-    # Wait up to 5 minutes for the log-following to finish
-    local waited=0
-    while kill -0 "$log_pid" 2>/dev/null && [[ $waited -lt 300 ]]; do
-      sleep 1
-      waited=$((waited + 1))
+      sleep 2
+      waited=$((waited + 2))
     done
-    if kill -0 "$log_pid" 2>/dev/null; then
-      kill "$log_pid" 2>/dev/null
-      error "Database initialization timed out after 5 minutes. Check: docker compose -p $project logs app"
-    else
-      wait "$log_pid" 2>/dev/null || true
+    if [[ $waited -ge 300 ]]; then
+      error "Database initialization timed out after 5 minutes."
+      error "Check: docker compose -p $project logs app"
     fi
 
-    # After DB init, recreate app without DB_INIT so restarts don't re-init
+    # Regenerate compose with DB_INIT=false so container restarts don't re-init
     generate_compose "$worktree_path" "$host_port" "false"
     docker compose -p "$project" -f "$worktree_path/docker-compose.yml" up -d app
   fi
