@@ -1,13 +1,17 @@
 FROM ruby:3.4.4-slim-bookworm
 
-# System dependencies
+# System dependencies + PostgreSQL 17 client (for pg_restore compatibility with pg17 dumps)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libpq-dev \
     libyaml-dev \
     git \
     curl \
-    postgresql-client \
+    gnupg \
+    && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /usr/share/keyrings/postgresql.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" > /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends postgresql-client-17 \
     && rm -rf /var/lib/apt/lists/*
 
 # Node.js 20 via nodesource
