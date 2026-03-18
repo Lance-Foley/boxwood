@@ -138,15 +138,14 @@ launch_tmux() {
   info "Starting tmux session: $session_name"
   tmux new-session -d -s "$session_name" -c "$worktree_path"
 
-  # Pane 0 (top-left): container logs
-  tmux send-keys -t "$session_name" "docker compose -p $project -f $worktree_path/docker-compose.yml logs -f app worker" Enter
+  # Pane 0 (top-left): shell inside container, auto-starts bin/dev
+  tmux send-keys -t "$session_name" "docker compose -p $project -f $worktree_path/docker-compose.yml exec app bash -c 'bin/dev'" Enter
 
   # Pane 1 (right): Claude Code on host
   tmux split-window -h -t "$session_name" -c "$worktree_path"
   tmux send-keys -t "$session_name" "claude --dangerously-skip-permissions" Enter
 
-  # Pane 2 (bottom-left): shell inside the app container
-  # This is where you run rails c, rake tasks, bin/dev, etc.
+  # Pane 2 (bottom-left): shell inside the app container for rails c, rake, etc.
   tmux select-pane -t "$session_name:.0"
   tmux split-window -v -t "$session_name" -c "$worktree_path" -l 30%
   tmux send-keys -t "$session_name" "docker compose -p $project -f $worktree_path/docker-compose.yml exec app bash" Enter
