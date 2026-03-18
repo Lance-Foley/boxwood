@@ -63,13 +63,13 @@ registry_prune() {
 next_port() {
   local used
   used=$(jq -r '.[] | select(.status == "active") | .port' "$SESSIONS_FILE")
-  for p in $(seq 3001 3010); do
+  for p in $(seq 3000 3005); do
     if ! echo "$used" | grep -qw "$p"; then
       echo "$p"
       return 0
     fi
   done
-  error "All session ports (3001-3010) are in use. Run 'ws end' to free a session."
+  error "All session ports (3000-3005) are in use. Run 'ws end' to free a session."
   return 1
 }
 
