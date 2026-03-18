@@ -22,7 +22,8 @@ if [ "$DB_INIT" = "true" ]; then
 
   echo "==> Restoring latest.dump..."
   # pg_restore returns non-zero on warnings (e.g. extension already exists) — this is OK
-  pg_restore --no-owner --no-acl -h db -U postgres -d wescomapp /dumps/latest.dump || true
+  # Uses -c --if-exists --clean to drop existing objects before restore
+  pg_restore -h db -U postgres -d wescomapp -c -v --if-exists --clean --no-owner --no-privileges /dumps/latest.dump || true
 
   echo "==> Running migrations..."
   bundle exec rails db:migrate
