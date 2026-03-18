@@ -430,14 +430,18 @@ cmd_end() {
   success "Containers stopped, volumes removed"
   echo ""
 
-  # Remove worktree
-  if confirm "Remove worktree ($worktree_path)?"; then
+  # Remove worktree + branch
+  if confirm "Remove worktree and local branch?"; then
     if [[ "$(pwd)" == "$worktree_path"* ]]; then
       cd "$HOME"
     fi
     git -C "$WESCOM_APP_PATH" worktree remove --force "$worktree_path" 2>/dev/null
     git -C "$WESCOM_APP_PATH" worktree prune 2>/dev/null
     success "Worktree removed"
+    # Delete the local branch so --new with same name works next time
+    git -C "$WESCOM_APP_PATH" branch -D "$branch" 2>/dev/null && success "Local branch '$branch' deleted" || true
+    # Clean up leftover directory if git worktree remove didn't get it
+    [[ -d "$worktree_path" ]] && rm -rf "$worktree_path"
     echo ""
   fi
 
