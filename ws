@@ -145,9 +145,11 @@ launch_tmux() {
   tmux split-window -h -t "$session_name" -c "$worktree_path"
   tmux send-keys -t "$session_name" "claude --dangerously-skip-permissions" Enter
 
-  # Pane 2 (bottom-left): clean terminal in worktree (use 'ws exec' for container commands)
+  # Pane 2 (bottom-left): shell inside the app container
+  # This is where you run rails c, rake tasks, bin/dev, etc.
   tmux select-pane -t "$session_name:.0"
   tmux split-window -v -t "$session_name" -c "$worktree_path" -l 30%
+  tmux send-keys -t "$session_name" "docker compose -p $project -f $worktree_path/docker-compose.yml exec app bash" Enter
 
   if [[ -n "${TMUX:-}" ]]; then
     exec tmux switch-client -t "$session_name"
