@@ -18,11 +18,11 @@ services:
     environment:
       DATABASE_URL: postgres://postgres@db/wescomapp
       SOLID_QUEUE_IN_PUMA: "false"
-      PORT: "3000"
+      PORT: "__HOST_PORT__"
       BINDING: "0.0.0.0"
       DB_INIT: "__DB_INIT__"
     ports:
-      - "__HOST_PORT__:3000"
+      - "__HOST_PORT__:__HOST_PORT__"
     volumes:
       - __WORKTREE_PATH__:/app
       - __WESCOM_APP_PATH__/latest.dump:/dumps/latest.dump:ro
