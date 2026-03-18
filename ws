@@ -243,6 +243,13 @@ cmd_attach() {
   fi
 
   # Resume or restart existing session
+  if [[ -d "$worktree_path" ]] && ! git -C "$worktree_path" rev-parse --git-dir > /dev/null 2>&1; then
+    # Directory exists but is not a valid git worktree — clean it up
+    warn "Orphaned directory found at $worktree_path — removing..."
+    rm -rf "$worktree_path"
+    git -C "$WESCOM_APP_PATH" worktree prune 2>/dev/null
+  fi
+
   if [[ -d "$worktree_path" ]]; then
     info "Existing worktree found at $worktree_path"
 
