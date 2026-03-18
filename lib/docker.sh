@@ -120,7 +120,7 @@ compose_up() {
       kill "$log_pid" 2>/dev/null
       error "Database initialization timed out after 5 minutes. Check: docker compose -p $project logs app"
     else
-      wait "$log_pid" 2>/dev/null
+      wait "$log_pid" 2>/dev/null || true
     fi
 
     # After DB init, recreate app without DB_INIT so restarts don't re-init
