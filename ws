@@ -12,12 +12,10 @@ SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
 
 # Source library files
 source "$SCRIPT_DIR/lib/colors.sh"
-source "$SCRIPT_DIR/lib/database.sh"
+source "$SCRIPT_DIR/lib/docker.sh"
 
 # Defaults
 : "${WESCOM_APP_PATH:=$HOME/code/WescomApp}"
-: "${PG_USER:=$(whoami)}"
-: "${PG_BASE_DB:=wescom_app_development}"
 : "${SESSIONS_FILE:=$HOME/.wescom-sessions.json}"
 : "${SESSIONS_DIR:=$HOME/code/wescom-sessions}"
 
@@ -65,13 +63,13 @@ registry_prune() {
 next_port() {
   local used
   used=$(jq -r '.[] | select(.status == "active") | .port' "$SESSIONS_FILE")
-  for p in 3000 3001 3002 3003 3004; do
+  for p in $(seq 3001 3010); do
     if ! echo "$used" | grep -qw "$p"; then
       echo "$p"
       return 0
     fi
   done
-  error "All session ports (3000-3004) are in use. Run 'ws end' to free a session."
+  error "All session ports (3001-3010) are in use. Run 'ws end' to free a session."
   return 1
 }
 
@@ -82,21 +80,15 @@ find_session_by_cwd() {
   ' "$SESSIONS_FILE" | head -1
 }
 
-setup_session() {
-  local worktree_path="$1" db_name="$2" port="$3" branch="$4" pr="${5:-}"
+setup_worktree() {
+  local worktree_path="$1" branch="$2" port="$3" pr="${4:-}"
 
-  # Copy .env and append overrides
+  # Copy .env from main repo (secrets, API keys)
   if [[ -f "$WESCOM_APP_PATH/.env" ]]; then
     cp "$WESCOM_APP_PATH/.env" "$worktree_path/.env"
   else
     touch "$worktree_path/.env"
   fi
-  cat >> "$worktree_path/.env" <<EOF
-DATABASE_URL=postgres://localhost/$db_name
-PORT=$port
-SOLID_QUEUE_IN_PUMA=false
-WEB_CONCURRENCY=0
-EOF
 
   # Session memory directory
   mkdir -p "$worktree_path/.session/memory"
@@ -106,54 +98,63 @@ EOF
 
 # Session Context
 - Branch: $branch
-- Database: $db_name
-- Port: $port
+- Port: $port (http://localhost:$port)
 ${pr:+- PR: #$pr}
 
-This is an isolated worktree session. Your database is separate
-from the main development database.
+This is an isolated worktree session running in Docker containers.
+Run commands inside the container via: ws exec <command>
+e.g. ws exec rails console
 
 Use .session/memory/ to track decisions, progress, and context
-about this work. Store session notes, decision logs, and progress
-updates in .session/memory/ so they persist across conversations.
+about this work.
 EOF
 
-  # Remove Solid Queue Puma plugin (causes macOS fork crash in worktrees)
-  local puma_rb="$worktree_path/config/puma.rb"
-  if [[ -f "$puma_rb" ]] && grep -q "plugin :solid_queue" "$puma_rb"; then
-    sed -i '' '/plugin :solid_queue/d' "$puma_rb"
-    success "Patched puma.rb: removed Solid Queue plugin"
-  fi
-
   # Git excludes so session files don't show as dirty
-  # Worktrees use a .git file (not directory), so resolve the real git dir
   local git_dir
   git_dir=$(git -C "$worktree_path" rev-parse --git-dir)
   mkdir -p "$git_dir/info"
-  echo "CLAUDE.md" >> "$git_dir/info/exclude"
-  echo ".session/" >> "$git_dir/info/exclude"
-  echo ".env" >> "$git_dir/info/exclude"
+  for f in CLAUDE.md .session/ .env docker-compose.yml; do
+    grep -qxF "$f" "$git_dir/info/exclude" 2>/dev/null || echo "$f" >> "$git_dir/info/exclude"
+  done
 }
 
 launch_tmux() {
-  local session_name="$1" worktree_path="$2" port="$3"
+  local session_name="$1" worktree_path="$2" project="$3"
 
-  # Open RubyMine (always, even on resume)
+  # Open RubyMine
   open -a "RubyMine" "$worktree_path" 2>/dev/null &
 
   # Resume existing tmux session if it exists
   if tmux has-session -t "$session_name" 2>/dev/null; then
     info "Reattaching to tmux session: $session_name"
-    exec tmux attach -t "$session_name"
+    if [[ -n "${TMUX:-}" ]]; then
+      exec tmux switch-client -t "$session_name"
+    else
+      exec tmux attach -t "$session_name"
+    fi
   fi
 
   # Create tmux session with split panes
   info "Starting tmux session: $session_name"
   tmux new-session -d -s "$session_name" -c "$worktree_path"
-  tmux send-keys -t "$session_name" "PORT=$port bin/dev" Enter
+
+  # Pane 0 (top-left): container logs
+  tmux send-keys -t "$session_name" "docker compose -p $project -f $worktree_path/docker-compose.yml logs -f app worker" Enter
+
+  # Pane 1 (right): Claude Code on host
   tmux split-window -h -t "$session_name" -c "$worktree_path"
   tmux send-keys -t "$session_name" "claude --dangerously-skip-permissions" Enter
-  exec tmux attach -t "$session_name"
+
+  # Pane 2 (bottom-left): shell inside container
+  tmux select-pane -t "$session_name:.0"
+  tmux split-window -v -t "$session_name" -c "$worktree_path" -l 30%
+  tmux send-keys -t "$session_name" "docker compose -p $project -f $worktree_path/docker-compose.yml exec app bash" Enter
+
+  if [[ -n "${TMUX:-}" ]]; then
+    exec tmux switch-client -t "$session_name"
+  else
+    exec tmux attach -t "$session_name"
+  fi
 }
 
 # ─── ws attach ──────────────────────────────────────────────────────────────
@@ -181,21 +182,34 @@ cmd_attach() {
     exit 1
   fi
 
+  # Check base image exists
+  if ! image_exists; then
+    error "Base image not found. Run 'ws rebuild' first."
+    exit 1
+  fi
+
+  # Check latest.dump exists
+  if [[ ! -f "$WESCOM_APP_PATH/latest.dump" ]]; then
+    error "No latest.dump found at $WESCOM_APP_PATH/latest.dump"
+    error "Download a production dump before creating sessions."
+    exit 1
+  fi
+
   registry_prune
 
-  # Resolve branch from PR (run gh from inside repo so it detects the remote)
+  # Resolve branch from PR
   if [[ -n "$pr_number" ]]; then
     info "Resolving branch from PR #${pr_number}..."
     local pr_json
     pr_json=$(cd "$WESCOM_APP_PATH" && gh pr view "$pr_number" --json headRefName 2>/dev/null) || {
-      error "PR #${pr_number} not found. Check the number and your gh auth status."
+      error "PR #${pr_number} not found."
       exit 1
     }
     branch=$(echo "$pr_json" | jq -r '.headRefName')
     success "PR #${pr_number} → branch: $branch"
   fi
 
-  # Create new branch (fetch first so origin/main is current)
+  # Create new branch
   if [[ -n "$new_name" ]]; then
     branch=$(slugify "$new_name")
     info "Creating new branch: $branch"
@@ -206,79 +220,123 @@ cmd_attach() {
   dir_name=$(slugify "$branch")
   local worktree_path="$SESSIONS_DIR/$dir_name"
   local tmux_session="ws-$dir_name"
+  local project
+  project=$(compose_project_name "$dir_name")
 
-  # Check for slug collision with different branch (guard against null .path from old entries)
+  # Check for slug collision
   local existing_branch
   existing_branch=$(jq -r --arg d "$dir_name" --arg b "$branch" \
-    '.[] | select(.status == "active" and .branch != $b and ((.path // .worktree_path // "") | endswith("/"+$d))) | .branch' \
+    '.[] | select(.status == "active" and .branch != $b and ((.path // "") | endswith("/"+$d))) | .branch' \
     "$SESSIONS_FILE" | head -1)
   if [[ -n "$existing_branch" ]]; then
     error "Directory name '$dir_name' is already used by branch '$existing_branch'."
     exit 1
   fi
 
-  # Resume existing session
+  # Resume or restart existing session
   if [[ -d "$worktree_path" ]]; then
     info "Existing worktree found at $worktree_path"
 
-    # Handle database: check if it exists
-    local db_name="wescomapp_dev_${dir_name//-/_}"
-    db_name="${db_name:0:63}"
-    if db_exists "$db_name"; then
-      if confirm "Database '$db_name' exists. Drop and re-clone?"; then
-        info "Fresh clone requested"
-        db_drop "$db_name"
-        db_clone "$db_name" || exit 1
+    # Fix detached HEAD
+    local current_head
+    current_head=$(git -C "$worktree_path" symbolic-ref --short HEAD 2>/dev/null || echo "DETACHED")
+    if [[ "$current_head" == "DETACHED" ]]; then
+      warn "Worktree is in detached HEAD state — attempting to fix..."
+      if git -C "$worktree_path" checkout "$branch" 2>/dev/null; then
+        success "Now tracking branch: $branch"
+      elif git -C "$worktree_path" checkout -b "$branch" "origin/$branch" 2>/dev/null; then
+        success "Created and tracking branch: $branch"
       else
-        info "Reusing existing database"
+        warn "Could not fix detached HEAD. Continuing..."
       fi
-    else
-      info "Database not found — creating fresh clone"
-      db_clone "$db_name" || exit 1
     fi
 
-    # Get port from registry or assign new one
+    # Get port from registry or assign new
     local port
     port=$(jq -r --arg b "$branch" '.[] | select(.branch == $b and .status == "active") | .port' "$SESSIONS_FILE" | head -1)
     if [[ -z "$port" || "$port" == "null" ]]; then
       port=$(next_port) || exit 1
-      registry_add "$branch" "$db_name" "$port" "$worktree_path" "${pr_number:-null}"
     fi
 
-    launch_tmux "$tmux_session" "$worktree_path" "$port"
-    exit 0  # Safety: should not reach here (launch_tmux uses exec)
+    # Setup worktree if .env missing (first time or clean worktree)
+    if [[ ! -f "$worktree_path/.env" ]]; then
+      setup_worktree "$worktree_path" "$branch" "$port" "${pr_number:-}"
+    fi
+
+    # Detect container state and act
+    local state
+    state=$(detect_session_state "$project")
+
+    if [[ "$state" == "resume" ]]; then
+      info "Containers already running"
+    else
+      # If user wants fresh DB, tear down first
+      if [[ "$state" != "first_run" ]] && volume_exists "$project"; then
+        if confirm "Database exists from previous run. Drop and re-initialize?"; then
+          compose_down "$project" "$worktree_path"
+          state="first_run"
+        fi
+      fi
+      compose_up "$project" "$worktree_path" "$port" "$state"
+    fi
+
+    # Ensure registry entry
+    local in_registry
+    in_registry=$(jq -r --arg b "$branch" '.[] | select(.branch == $b and .status == "active") | .branch' "$SESSIONS_FILE" | head -1)
+    if [[ -z "$in_registry" ]]; then
+      registry_add "$branch" "docker:$project" "$port" "$worktree_path" "${pr_number:-null}"
+    fi
+
+    launch_tmux "$tmux_session" "$worktree_path" "$project"
+    exit 0
   fi
 
-  # New session — create worktree, DB, env, memory
+  # New session — create worktree
   info "Creating session for branch: $branch"
   git -C "$WESCOM_APP_PATH" fetch origin
 
   if [[ -n "$new_name" ]]; then
-    # Branch off origin/main without mutating the main repo's checkout
     git -C "$WESCOM_APP_PATH" worktree add -b "$branch" "$worktree_path" origin/main
   else
-    git -C "$WESCOM_APP_PATH" worktree add "$worktree_path" "origin/$branch"
+    git -C "$WESCOM_APP_PATH" worktree add "$worktree_path" "$branch" 2>/dev/null || {
+      local stale_path
+      stale_path=$(git -C "$WESCOM_APP_PATH" worktree list --porcelain 2>/dev/null \
+        | awk -v b="$branch" '/^worktree /{p=$2} /^branch refs\/heads\//{if ($2 == "refs/heads/"b && p !~ /wescom-sessions/) print p}')
+      if [[ -n "$stale_path" ]]; then
+        warn "Branch '$branch' is checked out in a stale worktree at: $stale_path"
+        if confirm "Remove stale worktree and continue?"; then
+          git -C "$WESCOM_APP_PATH" worktree remove --force "$stale_path" 2>/dev/null
+          git -C "$WESCOM_APP_PATH" worktree prune 2>/dev/null
+          git -C "$WESCOM_APP_PATH" worktree add "$worktree_path" "$branch" || {
+            error "Still could not create worktree."; exit 1
+          }
+        else
+          error "Cannot create session — branch is checked out elsewhere."; exit 1
+        fi
+      else
+        error "Could not create worktree for '$branch'."
+        git -C "$WESCOM_APP_PATH" worktree list 2>/dev/null | grep -i "$dir_name" || true
+        exit 1
+      fi
+    }
   fi
   success "Worktree created at $worktree_path"
-
-  local db_name="wescomapp_dev_${dir_name//-/_}"
-  db_name="${db_name:0:63}"
-  db_clone "$db_name" || exit 1
 
   local port
   port=$(next_port) || exit 1
 
-  setup_session "$worktree_path" "$db_name" "$port" "$branch" "${pr_number:-}"
-  registry_add "$branch" "$db_name" "$port" "$worktree_path" "${pr_number:-null}"
+  setup_worktree "$worktree_path" "$branch" "$port" "${pr_number:-}"
+  compose_up "$project" "$worktree_path" "$port" "first_run"
+  registry_add "$branch" "docker:$project" "$port" "$worktree_path" "${pr_number:-null}"
 
   header "Session Ready"
   echo -e "  ${BOLD}Branch:${NC}    $branch"
-  echo -e "  ${BOLD}Database:${NC}  $db_name"
-  echo -e "  ${BOLD}Port:${NC}      $port"
+  echo -e "  ${BOLD}Port:${NC}      $port → http://localhost:$port"
   echo -e "  ${BOLD}Path:${NC}      $worktree_path"
+  echo -e "  ${BOLD}Containers:${NC} docker compose -p $project ps"
   echo ""
 
-  launch_tmux "$tmux_session" "$worktree_path" "$port"
+  launch_tmux "$tmux_session" "$worktree_path" "$project"
 }
 
 # ─── ws list ────────────────────────────────────────────────────────────────
@@ -296,30 +354,19 @@ cmd_list() {
     return
   fi
 
-  printf "  ${BOLD}%-30s %-40s %-6s %s${NC}\n" "BRANCH" "DATABASE" "PORT" "STARTED"
-  echo "  $(printf '%.0s─' {1..90})"
+  printf "  ${BOLD}%-30s %-6s %-15s %s${NC}\n" "BRANCH" "PORT" "CONTAINERS" "STARTED"
+  echo "  $(printf '%.0s─' {1..75})"
 
-  echo "$active" | jq -r '.[] | "\(.branch)\t\(.db // .db_name // "?")\t\(.port // "?")\t\(.started)"' |
-  while IFS=$'\t' read -r branch db port started; do
-    printf "  %-30s %-40s %-6s %s\n" "${branch:0:28}" "${db:0:38}" "$port" "$started"
+  echo "$active" | jq -r '.[] | "\(.branch)\t\(.port // "?")\t\(.started)"' |
+  while IFS=$'\t' read -r branch port started; do
+    local dir_name
+    dir_name=$(slugify "$branch")
+    local project
+    project=$(compose_project_name "$dir_name")
+    local status
+    status=$(compose_status_display "$project")
+    printf "  %-30s %-6s %-15b %s\n" "${branch:0:28}" "$port" "$status" "$started"
   done
-
-  # Check for orphaned databases
-  local session_dbs
-  session_dbs=$(db_list_session_dbs)
-  if [[ -n "$session_dbs" ]]; then
-    local orphaned=""
-    while IFS= read -r db; do
-      if ! echo "$active" | jq -e --arg db "$db" '.[] | select((.db // .db_name) == $db)' > /dev/null 2>&1; then
-        orphaned+="  $db\n"
-      fi
-    done <<< "$session_dbs"
-    if [[ -n "$orphaned" ]]; then
-      echo ""
-      warn "Orphaned databases (no active session):"
-      echo -e "$orphaned"
-    fi
-  fi
 }
 
 # ─── ws end ─────────────────────────────────────────────────────────────────
@@ -331,7 +378,7 @@ cmd_end() {
     case "$1" in
       --branch) branch="$2"; shift 2 ;;
       -*)       error "Unknown option: $1"; exit 1 ;;
-      *)        branch="$1"; shift ;;  # positional: ws end <branch>
+      *)        branch="$1"; shift ;;
     esac
   done
 
@@ -351,9 +398,13 @@ cmd_end() {
     exit 1
   fi
 
-  local db_name worktree_path
-  db_name=$(echo "$session" | jq -r '.db // .db_name')
-  worktree_path=$(echo "$session" | jq -r '.path // .worktree_path')
+  local worktree_path
+  worktree_path=$(echo "$session" | jq -r '.path')
+
+  local dir_name
+  dir_name=$(slugify "$branch")
+  local project
+  project=$(compose_project_name "$dir_name")
 
   header "Ending session: $branch"
 
@@ -374,11 +425,11 @@ cmd_end() {
     echo ""
   fi
 
-  # Drop DB
-  if confirm "Drop database ($db_name)?"; then
-    db_drop "$db_name"
-    echo ""
-  fi
+  # Stop containers and remove volumes
+  info "Stopping containers and removing database..."
+  compose_down "$project" "$worktree_path"
+  success "Containers stopped, volumes removed"
+  echo ""
 
   # Remove worktree
   if confirm "Remove worktree ($worktree_path)?"; then
@@ -391,20 +442,89 @@ cmd_end() {
     echo ""
   fi
 
-  # Mark ended in registry BEFORE killing tmux (in case we're running inside it)
+  # Mark ended in registry
   registry_end "$branch"
   success "Session ended: $branch"
 
-  # Kill tmux (may terminate our own shell if running inside the session)
-  local tmux_session="ws-$(slugify "$branch")"
+  # Kill tmux session
+  local tmux_session="ws-$dir_name"
   tmux kill-session -t "$tmux_session" 2>/dev/null && success "Tmux session killed" || true
+}
+
+# ─── ws rebuild ─────────────────────────────────────────────────────────────
+
+cmd_rebuild() {
+  header "Rebuilding base image"
+
+  # Ensure wescomapp repo exists
+  if [[ ! -d "$WESCOM_APP_PATH" ]]; then
+    error "WescomApp repo not found at $WESCOM_APP_PATH"
+    exit 1
+  fi
+
+  info "Fetching latest main..."
+  git -C "$WESCOM_APP_PATH" fetch origin
+
+  # Create a temporary build context with dependency files from main
+  local build_ctx
+  build_ctx=$(mktemp -d)
+  trap "rm -rf $build_ctx" EXIT
+
+  info "Copying dependency files from main branch..."
+  git -C "$WESCOM_APP_PATH" show origin/main:Gemfile > "$build_ctx/Gemfile"
+  git -C "$WESCOM_APP_PATH" show origin/main:Gemfile.lock > "$build_ctx/Gemfile.lock"
+  git -C "$WESCOM_APP_PATH" show origin/main:package.json > "$build_ctx/package.json"
+  git -C "$WESCOM_APP_PATH" show origin/main:yarn.lock > "$build_ctx/yarn.lock"
+
+  # Copy Dockerfile and entrypoint from ws repo
+  cp "$SCRIPT_DIR/Dockerfile" "$build_ctx/"
+  cp "$SCRIPT_DIR/docker-entrypoint.sh" "$build_ctx/"
+
+  info "Building image (this may take a few minutes on first run)..."
+  docker build -t wescomapp-dev:latest "$build_ctx"
+
+  local size
+  size=$(docker image inspect wescomapp-dev:latest --format '{{.Size}}' | awk '{printf "%.0f MB", $1/1024/1024}')
+  success "Image built: wescomapp-dev:latest ($size)"
+}
+
+# ─── ws exec ────────────────────────────────────────────────────────────────
+
+cmd_exec() {
+  if [[ $# -eq 0 ]]; then
+    error "Usage: ws exec <command>"
+    exit 1
+  fi
+
+  local branch
+  branch=$(find_session_by_cwd "$(pwd)")
+  if [[ -z "$branch" ]]; then
+    error "Not in a session directory. cd to a worktree first."
+    exit 1
+  fi
+
+  local dir_name
+  dir_name=$(slugify "$branch")
+  local project
+  project=$(compose_project_name "$dir_name")
+  local worktree_path="$SESSIONS_DIR/$dir_name"
+
+  # Check containers are running
+  local status
+  status=$(compose_status "$project")
+  if [[ "$status" != "running" ]]; then
+    error "Containers not running for session '$branch'. Run 'ws attach --branch $branch' first."
+    exit 1
+  fi
+
+  docker compose -p "$project" -f "$worktree_path/docker-compose.yml" exec app "$@"
 }
 
 # ─── Usage ──────────────────────────────────────────────────────────────────
 
 usage() {
   cat <<EOF
-${BOLD}ws${NC} — WescomApp Session Manager
+${BOLD}ws${NC} — WescomApp Session Manager (Docker)
 
 ${BOLD}Usage:${NC}
   ws attach --pr <number>            Attach to existing PR
@@ -412,20 +532,25 @@ ${BOLD}Usage:${NC}
   ws attach --new "description"      Create new branch + session
   ws list                            Show active sessions
   ws end [--branch <name>]           Clean up a session
+  ws rebuild                         Rebuild the base Docker image
+  ws exec <command>                  Run command in session container
 
 ${BOLD}Environment:${NC}
   WESCOM_APP_PATH    Path to WescomApp repo (default: ~/code/WescomApp)
-  PG_USER            PostgreSQL user (default: \$(whoami))
-  PG_BASE_DB         Source database to clone (default: wescom_app_development)
+
+${BOLD}Prerequisites:${NC}
+  OrbStack (or Docker), gh, tmux, jq, claude
 EOF
 }
 
 # ─── Main ───────────────────────────────────────────────────────────────────
 
 case "${1:-}" in
-  attach) shift; cmd_attach "$@" ;;
-  list)   cmd_list ;;
-  end)    shift; cmd_end "$@" ;;
+  attach)  shift; cmd_attach "$@" ;;
+  list)    cmd_list ;;
+  end)     shift; cmd_end "$@" ;;
+  rebuild) cmd_rebuild ;;
+  exec)    shift; cmd_exec "$@" ;;
   -h|--help|help) usage ;;
-  *)      usage ;;
+  *)       usage ;;
 esac
