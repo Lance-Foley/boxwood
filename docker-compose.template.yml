@@ -19,6 +19,7 @@ services:
       DATABASE_URL: postgres://postgres@db/wescomapp
       SOLID_QUEUE_IN_PUMA: "false"
       PORT: "3000"
+      BINDING: "0.0.0.0"
       DB_INIT: "__DB_INIT__"
     ports:
       - "__HOST_PORT__:3000"

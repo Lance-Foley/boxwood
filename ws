@@ -90,6 +90,15 @@ setup_worktree() {
     touch "$worktree_path/.env"
   fi
 
+  # Set DATABASE_URL to point to the container's Postgres (overrides database.yml)
+  # Remove any existing DATABASE_URL first, then append the container one
+  sed -i '' '/^DATABASE_URL=/d' "$worktree_path/.env" 2>/dev/null || true
+  echo "DATABASE_URL=postgres://postgres@db/wescomapp" >> "$worktree_path/.env"
+
+  # Bind Puma to all interfaces so Docker port forwarding works
+  sed -i '' '/^BINDING=/d' "$worktree_path/.env" 2>/dev/null || true
+  echo "BINDING=0.0.0.0" >> "$worktree_path/.env"
+
   # Session memory directory
   mkdir -p "$worktree_path/.session/memory"
 
