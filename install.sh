@@ -8,7 +8,7 @@ echo ""
 
 # Check prerequisites
 missing=()
-for cmd in git psql createdb dropdb jq gh tmux claude; do
+for cmd in git docker jq gh tmux claude; do
   if ! command -v "$cmd" &>/dev/null; then
     missing+=("$cmd")
   fi
@@ -18,12 +18,12 @@ if [[ ${#missing[@]} -gt 0 ]]; then
   echo "Missing prerequisites:"
   for cmd in "${missing[@]}"; do
     case "$cmd" in
-      jq)          echo "  $cmd — brew install jq" ;;
-      gh)          echo "  $cmd — brew install gh" ;;
-      tmux)        echo "  $cmd — brew install tmux" ;;
-      claude)      echo "  $cmd — npm install -g @anthropic-ai/claude-code" ;;
-      psql|createdb|dropdb) echo "  $cmd — brew install postgresql" ;;
-      *)           echo "  $cmd" ;;
+      docker)  echo "  $cmd — Install OrbStack: brew install orbstack" ;;
+      jq)      echo "  $cmd — brew install jq" ;;
+      gh)      echo "  $cmd — brew install gh" ;;
+      tmux)    echo "  $cmd — brew install tmux" ;;
+      claude)  echo "  $cmd — npm install -g @anthropic-ai/claude-code" ;;
+      *)       echo "  $cmd" ;;
     esac
   done
   echo ""
@@ -34,6 +34,12 @@ fi
 # Validate gh auth
 if ! gh auth status &>/dev/null; then
   echo "GitHub CLI is not authenticated. Run: gh auth login"
+  exit 1
+fi
+
+# Validate Docker is running
+if ! docker info > /dev/null 2>&1; then
+  echo "Docker daemon is not running. Start OrbStack (or Docker Desktop) and re-run."
   exit 1
 fi
 
@@ -53,7 +59,7 @@ echo "Installed ws to $INSTALL_DIR/ws"
 echo ""
 echo "Environment (add to shell profile if not already set):"
 echo "  export WESCOM_APP_PATH=~/code/WescomApp          # default"
-echo "  export PG_USER=$(whoami)                          # default"
-echo "  export PG_BASE_DB=wescom_app_development          # default"
 echo ""
-echo "Run: ws attach --new \"My first session\""
+echo "Next steps:"
+echo "  1. ws rebuild                         # Build the base Docker image"
+echo "  2. ws attach --new \"My first session\"  # Create your first session"
