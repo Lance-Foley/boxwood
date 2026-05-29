@@ -219,6 +219,14 @@ and it has no bearing on what a teammate sees when they adopt the same repo's `.
 ## Troubleshooting
 
 - **"Base image not found"** — run `ws rebuild` in the repo first.
+- **Edited `db-init.sh` or `docker-entrypoint.sh` and nothing changed?** — those scripts
+  are `COPY`'d into the golden base image at build time (see `.ws/Dockerfile`), so the
+  running container holds a frozen copy; edits take effect only after `ws rebuild`. The
+  `docker-compose.template.yml`, by contrast, is regenerated each attach — but from the
+  **main checkout** (`ws` reads it from the repo root, not the session worktree), so a
+  template edit must live in the main checkout to take effect, not in a session worktree.
+  (A future option, not yet built: mount these scripts read-only from the worktree so they
+  become live-editable, trading rebuild speed for live iteration.)
 - **"All session ports are in use"** — `ws end` a session, or widen `ports.range`.
 - **Session won't become healthy** — `docker compose -p ws-<repo>-<branch> logs` to see why
   the app healthcheck is failing.
