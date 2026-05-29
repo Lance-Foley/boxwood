@@ -29,7 +29,3 @@ secrets_file: .env
 # Delete this whole block for an app with no database.
 db:
   restore_command: /usr/local/bin/db-init.sh
-
-claude:
-  # Launch Claude Code with --dangerously-skip-permissions in the session pane.
-  skip_permissions: true

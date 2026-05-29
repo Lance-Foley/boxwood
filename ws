@@ -80,6 +80,21 @@ find_session_by_cwd() {
   ' "$REGISTRY" | head -1
 }
 
+# Resolve the Assistant command from the per-user config.
+#   key absent          → "claude" (default)
+#   key present, blank  → ""        (plain shell)
+#   key present, value  → that value
+# Caller must have run load_user_config first.
+resolve_assistant_command() {
+  local has_key
+  has_key=$(echo "$USER_CONFIG_JSON" | jq -r 'try (.assistant | has("command")) catch false' 2>/dev/null)
+  if [[ "$has_key" == "true" ]]; then
+    ucfg '.assistant.command'
+  else
+    echo "claude"
+  fi
+}
+
 setup_worktree() {
   local worktree_path="$1" branch="$2" port="$3" pr="${4:-}"
 
@@ -93,7 +108,18 @@ setup_worktree() {
 
   mkdir -p "$worktree_path/.session/memory"
 
-  cat >> "$worktree_path/CLAUDE.md" <<EOF
+  # Where the session-context block lands depends on the Assistant: Claude reads
+  # CLAUDE.md, anything else (or no assistant) gets a neutral .session/CONTEXT.md.
+  load_user_config
+  local assistant context_file
+  assistant=$(resolve_assistant_command)
+  if [[ "$assistant" == *claude* ]]; then
+    context_file="CLAUDE.md"
+  else
+    context_file=".session/CONTEXT.md"
+  fi
+
+  cat >> "$worktree_path/$context_file" <<EOF
 
 # Session Context
 - Repo: $REPO
@@ -112,18 +138,33 @@ EOF
   local git_dir
   git_dir=$(git -C "$worktree_path" rev-parse --git-dir)
   mkdir -p "$git_dir/info"
-  for f in CLAUDE.md .session/ .env docker-compose.yml; do
+  for f in "$context_file" .session/ .env docker-compose.yml; do
     grep -qxF "$f" "$git_dir/info/exclude" 2>/dev/null || echo "$f" >> "$git_dir/info/exclude"
   done
 }
 
 launch_tmux() {
+  if [[ -n "${WS_NO_ATTACH:-}" ]]; then return 0; fi
+
   local full_session="$1" worktree_path="$2" project="$3" port="$4" pr_number="$5"
 
-  local app_service claude_cmd
+  local app_service editor assistant_cmd skipperm
   app_service=$(cfg_default '.compose.app_service' 'app')
-  claude_cmd="claude"
-  [[ "$(cfg '.claude.skip_permissions')" == "true" ]] && claude_cmd="claude --dangerously-skip-permissions"
+
+  # In-tmux editor: per-user config → $EDITOR → nvim.
+  load_user_config
+  editor=$(ucfg '.editor')
+  [[ -z "$editor" ]] && editor="${EDITOR:-}"
+  [[ -z "$editor" ]] && editor="nvim"
+
+  # Assistant pane: per-user config (key absent → claude; blank → plain shell).
+  assistant_cmd=$(resolve_assistant_command)
+  skipperm=$(ucfg '.assistant.skip_permissions')
+  if [[ -z "$assistant_cmd" ]]; then
+    assistant_cmd="bash"
+  elif [[ "$assistant_cmd" == *claude* && "$skipperm" == "true" ]]; then
+    assistant_cmd="$assistant_cmd --dangerously-skip-permissions"
+  fi
 
   # Ghostty tab title
   local tab_title="localhost:${port}"
@@ -132,7 +173,9 @@ launch_tmux() {
   fi
   printf '\033]0;%s\007' "$tab_title"
 
-  open -a "RubyMine" "$worktree_path" 2>/dev/null &
+  # External GUI editor: only if the per-user config names one.
+  local gui; gui=$(ucfg '.gui_editor')
+  [[ -n "$gui" ]] && open -a "$gui" "$worktree_path" 2>/dev/null &
 
   if tmux has-session -t "$full_session" 2>/dev/null; then
     info "Reattaching to tmux session: $full_session"
@@ -163,8 +206,8 @@ launch_tmux() {
   pane_shell=$(tmux split-window -h -t "$pane_dev" -c "$worktree_path" -P -F '#{pane_id}')
 
   local compose="docker compose -p $project -f $worktree_path/docker-compose.yml"
-  tmux send-keys -t "$pane_nvim" "nvim ." Enter
-  tmux send-keys -t "$pane_claude" "$claude_cmd" Enter
+  tmux send-keys -t "$pane_nvim" "$editor ." Enter
+  tmux send-keys -t "$pane_claude" "$assistant_cmd" Enter
   tmux send-keys -t "$pane_dev" "$compose logs -f $app_service" Enter
   tmux send-keys -t "$pane_shell" "$compose exec $app_service bash" Enter
   tmux select-pane -t "$pane_nvim"
@@ -203,6 +246,15 @@ cmd_init() {
   fi
 
   cp -R "$src" "$dest"
+
+  # Warn (loudly) if this repo's .gitignore would prevent .ws/ from being
+  # committed — otherwise teammates clone a repo with no recipe and `ws attach`
+  # errors with "No .ws/config.yml found". WARN ONLY: never mutate .gitignore.
+  if git -C "$REPO_ROOT" check-ignore -q .ws 2>/dev/null; then
+    warn ".ws/ is gitignored in this repo — teammates won't get the recipe."
+    echo -e "  Fix: append ${BOLD}!.ws/${NC} to $REPO_ROOT/.gitignore so the recipe is committable."
+  fi
+
   header "Scaffolded .ws/ ($template) in $REPO"
   echo -e "  Edit ${BOLD}.ws/config.yml${NC} and the Docker assets to match this repo, then:"
   echo -e "    ${BOLD}ws rebuild${NC}                      # build the base image"
@@ -214,12 +266,13 @@ cmd_init() {
 # ─── ws attach ────────────────────────────────────────────────────────────────
 
 cmd_attach() {
-  local branch="" pr_number="" new_name=""
+  local branch="" pr_number="" new_name="" reset=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --pr)     pr_number="$2"; shift 2 ;;
       --branch) branch="$2"; shift 2 ;;
       --new)    new_name="$2"; shift 2 ;;
+      --reset)  reset=1; shift ;;
       *)        error "Unknown argument: $1"; usage; exit 1 ;;
     esac
   done
@@ -298,9 +351,19 @@ cmd_attach() {
     current_head=$(git -C "$worktree_path" symbolic-ref --short HEAD 2>/dev/null || echo "DETACHED")
     if [[ "$current_head" == "DETACHED" ]]; then
       warn "Worktree is in detached HEAD state — attempting to fix..."
-      git -C "$worktree_path" checkout "$branch" 2>/dev/null && success "Now tracking branch: $branch" \
-        || git -C "$worktree_path" checkout -b "$branch" "origin/$branch" 2>/dev/null && success "Created and tracking: $branch" \
-        || warn "Could not fix detached HEAD. Continuing..."
+      if git -C "$worktree_path" checkout "$branch" 2>/dev/null; then
+        success "Now tracking branch: $branch"
+      elif git -C "$worktree_path" checkout -b "$branch" "origin/$branch" 2>/dev/null; then
+        success "Created and tracking: $branch"
+      else
+        warn "Automatic checkout failed."
+      fi
+      # Re-verify: never launch a session in detached HEAD (commits there are lost).
+      if ! git -C "$worktree_path" symbolic-ref --short HEAD >/dev/null 2>&1; then
+        error "Worktree at $worktree_path is still in detached HEAD; refusing to launch."
+        error "Fix manually: git -C \"$worktree_path\" checkout $branch"
+        exit 1
+      fi
     fi
 
     local port
@@ -318,7 +381,10 @@ cmd_attach() {
       info "Containers already running"
     else
       if [[ "$state" != "first_run" ]] && project_has_volumes "$project" && has_db; then
-        if confirm "Database exists from a previous run. Drop and re-initialize?"; then
+        # --reset drops outright (explicit consent, no inner prompt). Without it,
+        # this is a DESTRUCTIVE confirm (default N): under WS_ASSUME_YES it
+        # auto-NOs, so a scripted attach PRESERVES the existing database.
+        if [[ -n "$reset" ]] || confirm "Database exists from a previous run. Drop and re-initialize?" N; then
           compose_down "$project" "$worktree_path"; state="first_run"
         fi
       fi
@@ -335,10 +401,23 @@ cmd_attach() {
 
   # ── New session — create worktree ──
   info "Creating session for branch: $branch"
-  git -C "$REPO_ROOT" fetch origin
+
+  # Resolve the base ref for new worktrees, degrading gracefully when there is
+  # no 'origin' remote (local-only / GitLab / non-origin repos).
+  local base_ref
+  if git -C "$REPO_ROOT" remote get-url origin >/dev/null 2>&1; then
+    git -C "$REPO_ROOT" fetch origin >/dev/null 2>&1 || true
+    base_ref="origin/$main_branch"
+  else
+    base_ref="$main_branch"
+  fi
+  if ! git -C "$REPO_ROOT" rev-parse --verify --quiet "$base_ref" >/dev/null 2>&1; then
+    base_ref="$main_branch"
+    git -C "$REPO_ROOT" rev-parse --verify --quiet "$base_ref" >/dev/null 2>&1 || base_ref="HEAD"
+  fi
 
   if [[ -n "$new_name" ]]; then
-    git -C "$REPO_ROOT" worktree add -b "$branch" "$worktree_path" "origin/$main_branch"
+    git -C "$REPO_ROOT" worktree add -b "$branch" "$worktree_path" "$base_ref"
   else
     git -C "$REPO_ROOT" worktree add "$worktree_path" "$branch" 2>/dev/null || {
       local stale_path
@@ -346,7 +425,7 @@ cmd_attach() {
         | awk -v b="$branch" '/^worktree /{p=$2} /^branch refs\/heads\//{if ($2 == "refs/heads/"b) print p}')
       if [[ -n "$stale_path" && "$stale_path" != "$worktree_path" ]]; then
         warn "Branch '$branch' is checked out in a stale worktree at: $stale_path"
-        if confirm "Remove stale worktree and continue?"; then
+        if confirm "Remove stale worktree and continue?" Y; then
           git -C "$REPO_ROOT" worktree remove --force "$stale_path" 2>/dev/null || true
           git -C "$REPO_ROOT" worktree prune 2>/dev/null || true
           git -C "$REPO_ROOT" worktree add "$worktree_path" "$branch" || { error "Still could not create worktree."; exit 1; }
@@ -428,12 +507,14 @@ cmd_list() {
 # ─── ws end ───────────────────────────────────────────────────────────────────
 
 cmd_end() {
-  local branch=""
+  local branch="" push=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --branch) branch="$2"; shift 2 ;;
-      -*)       error "Unknown option: $1"; exit 1 ;;
-      *)        branch="$1"; shift ;;
+      --branch)   branch="$2"; shift 2 ;;
+      --push)     push="yes"; shift ;;
+      --no-push)  push="no"; shift ;;
+      -*)         error "Unknown option: $1"; exit 1 ;;
+      *)          branch="$1"; shift ;;
     esac
   done
 
@@ -468,7 +549,10 @@ cmd_end() {
     echo ""
   fi
 
-  if confirm "Push branch to origin?"; then
+  # Push is DESTRUCTIVE-by-default (publishes work): with neither flag the confirm
+  # defaults to N, so WS_ASSUME_YES auto-NOs (no accidental push). --push forces
+  # it; --no-push skips it.
+  if [[ "$push" == "yes" ]] || { [[ -z "$push" ]] && confirm "Push branch to origin?" N; }; then
     git -C "$worktree_path" push -u origin "$branch" 2>/dev/null && success "Branch pushed" || warn "Push failed"
     echo ""
   fi
@@ -478,7 +562,7 @@ cmd_end() {
   success "Containers stopped, volumes removed"
   echo ""
 
-  if confirm "Remove worktree and local branch?"; then
+  if confirm "Remove worktree and local branch?" Y; then
     [[ "$(pwd)" == "$worktree_path"* ]] && cd "$HOME"
     git -C "$REPO_ROOT" worktree remove --force "$worktree_path" 2>/dev/null || true
     git -C "$REPO_ROOT" worktree prune 2>/dev/null || true
@@ -510,19 +594,30 @@ cmd_rebuild() {
   [[ -f "$REPO_ROOT/$dockerfile" ]] || { error "Dockerfile not found: $REPO_ROOT/$dockerfile"; exit 1; }
 
   info "Fetching latest $main_branch..."
-  git -C "$REPO_ROOT" fetch origin
+  local src_ref
+  if git -C "$REPO_ROOT" remote get-url origin >/dev/null 2>&1; then
+    git -C "$REPO_ROOT" fetch origin >/dev/null 2>&1 || true
+    src_ref="origin/$main_branch"
+  else
+    src_ref="$main_branch"
+  fi
+  git -C "$REPO_ROOT" rev-parse --verify --quiet "$src_ref" >/dev/null 2>&1 || src_ref="$main_branch"
+  git -C "$REPO_ROOT" rev-parse --verify --quiet "$src_ref" >/dev/null 2>&1 || src_ref="HEAD"
 
-  local build_ctx; build_ctx=$(mktemp -d)
-  trap 'rm -rf "$build_ctx"' EXIT
+  # build_ctx is intentionally NOT local: the EXIT trap fires in global scope,
+  # where a function-local would be unset (fatal under set -u, and would leak
+  # the temp dir). The guard keeps the trap safe even if mktemp never ran.
+  build_ctx=$(mktemp -d)
+  trap 'rm -rf "${build_ctx:-}" 2>/dev/null' EXIT
 
-  # Copy dependency files from origin/<main_branch> into the build context root.
-  info "Copying dependency files from origin/$main_branch..."
+  # Copy dependency files from <src_ref> into the build context root.
+  info "Copying dependency files from $src_ref..."
   local f
   while IFS= read -r f; do
     [[ -z "$f" ]] && continue
     mkdir -p "$build_ctx/$(dirname "$f")"
-    git -C "$REPO_ROOT" show "origin/$main_branch:$f" > "$build_ctx/$f" 2>/dev/null || {
-      error "Could not read '$f' from origin/$main_branch"; exit 1
+    git -C "$REPO_ROOT" show "$src_ref:$f" > "$build_ctx/$f" 2>/dev/null || {
+      error "Could not read '$f' from $src_ref"; exit 1
     }
   done < <(echo "$CONFIG_JSON" | jq -r '.image.build_context_from_main[]?')
 
@@ -564,10 +659,11 @@ cmd_exec() {
 # ─── ws db-restore ────────────────────────────────────────────────────────────
 
 cmd_db_restore() {
-  local branch=""
+  local branch="" yes=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --branch) branch="$2"; shift 2 ;;
+      --yes)    yes=1; shift ;;
       -*)       error "Unknown option: $1"; exit 1 ;;
       *)        branch="$1"; shift ;;
     esac
@@ -593,7 +689,12 @@ cmd_db_restore() {
   fi
 
   warn "This will reset the session database via: $restore_cmd"
-  confirm "Continue?" || exit 0
+  # --yes forces the restore (the only scriptable path). Without it this is a
+  # DESTRUCTIVE confirm (default N): under WS_ASSUME_YES it auto-NOs and the
+  # restore is a no-op (the `|| exit 0` returns success without resetting).
+  if [[ -z "$yes" ]]; then
+    confirm "Continue?" N || exit 0
+  fi
 
   info "Restoring database..."
   # set -e propagates a non-zero exit straight out of ws.
@@ -608,35 +709,44 @@ usage() {
 ${BOLD}ws${NC} — boxwood: isolated containerized dev sessions, one per git worktree
 
 ${BOLD}Usage:${NC}
-  ws init [--template <name>]        Scaffold .ws/ in the current repo
-  ws attach --pr <number>            Attach to an existing PR
-  ws attach --branch <name>          Attach to an existing branch
-  ws attach --new "description"      Create a new branch + session
-  ws list [--all]                    Active sessions (current repo, or --all)
-  ws end [--branch <name>]           Tear down a session
-  ws rebuild                         Build/refresh this repo's base image
-  ws exec <command>                  Run a command in the session container
-  ws db-restore [--branch <name>]    Re-run the repo's DB setup
+  ws init [--template <name>]              Scaffold .ws/ in the current repo
+  ws attach --pr <number> [--reset]        Attach to an existing PR
+  ws attach --branch <name> [--reset]      Attach to an existing branch
+  ws attach --new "description" [--reset]  Create a new branch + session
+  ws list [--all]                          Active sessions (current repo, or --all)
+  ws end [--branch <name>] [--push|--no-push]   Tear down a session
+  ws rebuild                               Build/refresh this repo's base image
+  ws exec <command>                        Run a command in the session container
+  ws db-restore [--branch <name>] [--yes]  Re-run the repo's DB setup
+
+${BOLD}Flags:${NC}
+  --reset      (attach) Drop an existing session DB volume and re-initialize.
+  --push       (end) Push the branch to origin without prompting.
+  --no-push    (end) Skip the push (default under WS_ASSUME_YES).
+  --yes        (db-restore) Reset the DB without prompting (required to script it).
 
 ${BOLD}How it works:${NC}
   Run inside any repo that has a committed .ws/ recipe (see 'ws init').
   Sessions live in ~/.ws/sessions/<repo>/<branch>/; state in ~/.ws/registry.json.
 
 ${BOLD}Prerequisites:${NC}
-  Docker (OrbStack recommended), git, jq, ruby, tmux, claude; gh for --pr.
+  Docker (OrbStack recommended), git, jq, yq, tmux; claude (optional Assistant); gh for --pr.
 EOF
 }
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
-case "${1:-}" in
-  init)       shift; cmd_init "$@" ;;
-  attach)     shift; cmd_attach "$@" ;;
-  list)       shift; cmd_list "$@" ;;
-  end)        shift; cmd_end "$@" ;;
-  rebuild)    cmd_rebuild ;;
-  exec)       shift; cmd_exec "$@" ;;
-  db-restore) shift; cmd_db_restore "$@" ;;
-  -h|--help|help) usage ;;
-  *)          usage ;;
-esac
+# Guarded so the script can be sourced for unit testing without dispatching.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  case "${1:-}" in
+    init)       shift; cmd_init "$@" ;;
+    attach)     shift; cmd_attach "$@" ;;
+    list)       shift; cmd_list "$@" ;;
+    end)        shift; cmd_end "$@" ;;
+    rebuild)    cmd_rebuild ;;
+    exec)       shift; cmd_exec "$@" ;;
+    db-restore) shift; cmd_db_restore "$@" ;;
+    -h|--help|help) usage ;;
+    *)          usage ;;
+  esac
+fi

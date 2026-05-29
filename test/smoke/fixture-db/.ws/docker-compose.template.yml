@@ -1,0 +1,42 @@
+# Per-session stack for the with-DB smoke fixture. boxwood substitutes
+# __HOST_PORT__, __WORKTREE_PATH__, and __DB_INIT__ when it generates the
+# session's docker-compose.yml. This exercises boxwood's has_db=true path and
+# named-volume detection (the pgdata volume below).
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  app:
+    image: boxwood-smoke-db:latest
+    environment:
+      PORT: "__HOST_PORT__"
+      DB_INIT: "__DB_INIT__"
+    ports:
+      - "__HOST_PORT__:__HOST_PORT__"
+    volumes:
+      - __WORKTREE_PATH__:/app
+    env_file:
+      - __WORKTREE_PATH__/.env
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      # Healthy once first-run init wrote the marker, or when no init was requested.
+      test: ["CMD-SHELL", "test -f /tmp/.db_initialized || test \"$DB_INIT\" != 'true'"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+      start_period: 1s
+
+# Named volume drives boxwood's project_has_volumes() detection (has-run-before).
+volumes:
+  pgdata:

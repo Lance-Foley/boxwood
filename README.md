@@ -3,9 +3,9 @@
 **Isolated, containerized dev sessions — one per git worktree — for any repo.**
 
 Each session is a git worktree with its own Docker Compose stack (database,
-services, ports), tmux layout, and Claude Code context — fully sealed off from your
-other work and from `main`. Point it at a branch or PR and `boxwood` builds the
-environment; close it and everything tears down cleanly.
+services, ports), tmux layout, and an **Assistant** context (Claude Code by default)
+— fully sealed off from your other work and from `main`. Point it at a branch or PR
+and `boxwood` builds the environment; close it and everything tears down cleanly.
 
 A repo opts in by committing a `.ws/` recipe; `boxwood` itself is stack-agnostic.
 The CLI is `ws`.
@@ -29,7 +29,7 @@ your-repo/                         ~/.ws/
 ```
 
 - `ws` finds the repo you're in (via git), reads its `.ws/config.yml`, and orchestrates:
-  git worktree → per-session Docker stack → host port → tmux → Claude Code.
+  git worktree → per-session Docker stack → host port → tmux → Assistant.
 - Worktrees live under `~/.ws/sessions/<repo>/<branch>/` — real git checkouts, so your
   IDE sees full history and diffs against `main`.
 - One `~/.ws/registry.json` tracks sessions across **all** repos.
@@ -40,18 +40,21 @@ your-repo/                         ~/.ws/
 
 ## Install
 
-**Prerequisites:** Docker ([OrbStack](https://orbstack.dev) recommended on macOS),
-`git`, `jq`, `ruby` (for parsing `.ws/config.yml` — preinstalled on macOS), `tmux`,
-and the [Claude Code](https://claude.com/claude-code) CLI. `gh` is optional (only for
-`ws attach --pr`).
+**Prerequisites (macOS):** Docker ([OrbStack](https://orbstack.dev)), `git`, `jq`,
+`yq`, and `tmux` are **required**. `gh` is optional (only `ws attach --pr` uses it);
+[Claude Code](https://claude.com/claude-code) is optional (only the Assistant pane uses
+it). The installer below provisions everything for you.
 
 ```sh
-git clone git@github.com:Lance-Foley/boxwood.git
-cd boxwood
-./install.sh        # checks deps, symlinks `ws` onto your PATH
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Lance-Foley/boxwood/main/install.sh)"
 ```
 
-`install.sh` symlinks `ws` into `/usr/local/bin` (or `~/.local/bin`).
+The one-liner bootstraps Homebrew if it isn't already present, installs the required
+tools (`git`, `tmux`, `jq`, `yq`, `gh`) plus OrbStack, clones boxwood to `~/.boxwood`,
+and symlinks `ws` onto your PATH. It then runs a short interactive tail for the steps
+that can't be automated: launching OrbStack, `gh auth login`, and optionally installing
+Claude Code. Those three — Docker, GitHub auth, and the Assistant — are the
+irreducibly-interactive parts; everything else is hands-off.
 
 ---
 
@@ -75,14 +78,18 @@ You land in a tmux window:
 
 ```
 ┌─────────────────┬─────────────────┐
-│  nvim .         │  Claude Code    │
+│  editor .       │  Assistant      │
 ├─────────────────┼─────────────────┤
 │  app logs       │  container shell│
 └─────────────────┴─────────────────┘
 ```
 
-RubyMine opens on the worktree, the app is live at `http://localhost:<port>`, and the
-dev server runs inside the container (it self-heals on restart).
+The top-left pane runs your configured editor (defaults to `$EDITOR`, then `nvim`); the
+top-right runs your configured Assistant (Claude Code by default, or a plain shell if you
+skip it). If you set a GUI editor it also opens on the worktree. The app is live at
+`http://localhost:<port>`, and the dev server runs inside the container (it self-heals on
+restart). Editor and Assistant come from your [per-user config](#per-user-config-wsconfigyml),
+not the repo's recipe.
 
 ---
 
@@ -131,10 +138,10 @@ secrets_file: .env                 # copied from the main checkout into each wor
 
 db:                                # delete this block for an app with no database
   restore_command: /usr/local/bin/db-init.sh
-
-claude:
-  skip_permissions: true           # launch Claude with --dangerously-skip-permissions
 ```
+
+The recipe describes the **stack** only — your editor and Assistant live in your
+[per-user config](#per-user-config-wsconfigyml), never in the committed `.ws/`.
 
 ### Compose template substitutions
 
@@ -169,6 +176,34 @@ migrate). `db-init.sh` is the single source of truth — both first-run init and
 
 ---
 
+## Per-user config (`~/.ws/config.yml`)
+
+The committed `.ws/` recipe describes the **stack**; `~/.ws/config.yml` describes the
+**developer**. Your editor and Assistant follow you across every repo and are never
+committed — change repos and your tools come with you.
+
+```yaml
+editor: nvim                       # in-tmux editor; defaults to $EDITOR, then nvim
+gui_editor: ""                     # external GUI editor (e.g. "rubymine", "code");
+                                   # defaults to none — nothing extra opens
+
+assistant:
+  command: claude                  # the Assistant in the top-right pane; defaults to
+                                   # Claude. Set to "" to skip it (plain shell instead).
+  skip_permissions: true           # launch Claude with --dangerously-skip-permissions
+```
+
+- **`editor`** — runs in the top-left tmux pane. Falls back to `$EDITOR`, then `nvim`.
+- **`gui_editor`** — an external GUI editor opened on the worktree. Defaults to none;
+  set it only if you want a desktop IDE alongside the tmux layout.
+- **`assistant.command`** — the AI tool in the top-right pane. Defaults to Claude Code,
+  but is fully skippable: leave it empty and the pane is just a shell.
+
+This file is per-user preference, not machine state — boxwood doesn't write it for you,
+and it has no bearing on what a teammate sees when they adopt the same repo's `.ws/`.
+
+---
+
 ## Lifecycle states
 
 `ws attach` figures out what to do from the containers + volumes:
@@ -189,6 +224,16 @@ migrate). `db-init.sh` is the single source of truth — both first-run init and
   the app healthcheck is failing.
 - **Stale worktree blocking a branch** — `ws` offers to remove it; otherwise
   `git worktree prune` in the main checkout.
+
+---
+
+## Testing / Development
+
+- `bats test/` — unit tests for the engine's pure logic.
+- `test/smoke.sh` — a smoke-lifecycle check against an `alpine` image (full
+  first-run → resume → restart → end cycle, no real stack).
+- WescomApp is the one-shot real-world parity run — proof the de-Wescom'd engine still
+  reproduces the original tool's behavior on a real Rails + Postgres repo.
 
 ---
 
