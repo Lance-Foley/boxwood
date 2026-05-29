@@ -63,6 +63,14 @@ checkout (so a template edit must live in the main checkout, not a session workt
 and unlike the worktree-mounted app code at `/app`, which is genuinely live.
 _Avoid_: dev image, base container
 
+**Base ref**:
+The git ref a new **Session**'s worktree branches from, and that `ws rebuild`
+builds the **Golden base image** from. Resolved with graceful degradation:
+`origin/<main_branch>` (when an `origin` remote exists) → local `<main_branch>` →
+`HEAD`. Shared by `ws attach` and `ws rebuild` so the two never disagree on what
+"latest main" means.
+_Avoid_: main, origin/main (those are specific values the Base ref resolves to, not the concept itself)
+
 **Dependency drift**:
 When a branch adds gems/packages not in the golden image. Reconciled by the container
 entrypoint on start; installs land in the session's own `bundle_cache` volume.

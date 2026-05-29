@@ -14,6 +14,7 @@ SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
 source "$SCRIPT_DIR/lib/colors.sh"
 source "$SCRIPT_DIR/lib/config.sh"
 source "$SCRIPT_DIR/lib/docker.sh"
+source "$SCRIPT_DIR/lib/worktree.sh"
 
 # ─── boxwood home ─────────────────────────────────────────────────────────────
 : "${WS_HOME:=$HOME/.ws}"
@@ -460,132 +461,65 @@ cmd_attach() {
     exit 1
   fi
 
-  # Clean up an orphaned (non-worktree) directory
-  if [[ -d "$worktree_path" ]] && ! git -C "$worktree_path" rev-parse --git-dir > /dev/null 2>&1; then
-    warn "Orphaned directory found at $worktree_path — removing..."
-    rm -rf "$worktree_path"
-    git -C "$REPO_ROOT" worktree prune 2>/dev/null || true
+  # Provision the worktree (one seam for every git edge case — orphaned dir,
+  # detached HEAD, branch parked in a stale worktree). On return it exists at
+  # $worktree_path on $branch, or we've already failed loudly. The Base ref is
+  # resolved only when actually creating a NEW branch (--new on a path that
+  # doesn't exist yet), so a resume never triggers a git fetch.
+  local base_ref=""
+  if [[ -n "$new_name" && ! -d "$worktree_path" ]]; then
+    base_ref=$(resolve_base_ref "$REPO_ROOT" "$main_branch")
+  fi
+  ensure_worktree "$REPO_ROOT" "$worktree_path" "$branch" "$base_ref" || exit 1
+
+  # ── From here the create and resume paths are identical: the Registry decides
+  #    the port, and the pgdata volume (not the Registry) decides the DB
+  #    lifecycle. A brand-new worktree has no containers/volume, so
+  #    detect_session_state returns first_run and the drop-DB confirm is skipped. ──
+
+  # Reuse the port already recorded for this session; allocate a NEW one only
+  # when none exists. A freshly allocated port is registered atomically under
+  # the lock (allocate_and_register), so a concurrent attach sees it as taken
+  # before we release. `registered` tracks whether that already happened, so
+  # the post-compose_up guard below never appends a duplicate row.
+  local port registered=""
+  port=$(jq -r --arg r "$REPO" --arg b "$branch" '.[] | select(.repo == $r and .branch == $b and .status == "active") | .port' "$REGISTRY" | head -1)
+  if [[ -z "$port" || "$port" == "null" ]]; then
+    port=$(with_registry_lock allocate_and_register \
+             "$REPO" "$branch" "$project" "$worktree_path" "${pr_number:-null}") || exit 1
+    registered=1
+  fi
+  if [[ -z "$pr_number" ]]; then
+    pr_number=$(jq -r --arg r "$REPO" --arg b "$branch" '.[] | select(.repo == $r and .branch == $b and .status == "active") | .pr // empty' "$REGISTRY" | head -1)
   fi
 
-  # ── Resume / restart an existing worktree ──
-  if [[ -d "$worktree_path" ]]; then
-    info "Existing worktree found at $worktree_path"
+  # First-time setup of this worktree dir (idempotent: skipped once .env exists,
+  # so a resume never re-appends the session-context block).
+  [[ -f "$worktree_path/.env" ]] || setup_worktree "$worktree_path" "$branch" "$port" "${pr_number:-}"
 
-    local current_head
-    current_head=$(git -C "$worktree_path" symbolic-ref --short HEAD 2>/dev/null || echo "DETACHED")
-    if [[ "$current_head" == "DETACHED" ]]; then
-      warn "Worktree is in detached HEAD state — attempting to fix..."
-      if git -C "$worktree_path" checkout "$branch" 2>/dev/null; then
-        success "Now tracking branch: $branch"
-      elif git -C "$worktree_path" checkout -b "$branch" "origin/$branch" 2>/dev/null; then
-        success "Created and tracking: $branch"
-      else
-        warn "Automatic checkout failed."
-      fi
-      # Re-verify: never launch a session in detached HEAD (commits there are lost).
-      if ! git -C "$worktree_path" symbolic-ref --short HEAD >/dev/null 2>&1; then
-        error "Worktree at $worktree_path is still in detached HEAD; refusing to launch."
-        error "Fix manually: git -C \"$worktree_path\" checkout $branch"
-        exit 1
-      fi
-    fi
-
-    # Reuse the port already recorded for this session; only allocate a NEW one
-    # when none exists. A freshly allocated port is registered atomically under
-    # the lock (allocate_and_register), so a concurrent attach sees it as taken
-    # before we release. `registered` tracks whether that already happened, so
-    # the post-compose_up guard below never appends a duplicate row.
-    local port registered=""
-    port=$(jq -r --arg r "$REPO" --arg b "$branch" '.[] | select(.repo == $r and .branch == $b and .status == "active") | .port' "$REGISTRY" | head -1)
-    if [[ -z "$port" || "$port" == "null" ]]; then
-      port=$(with_registry_lock allocate_and_register \
-               "$REPO" "$branch" "$project" "$worktree_path" "${pr_number:-null}") || exit 1
-      registered=1
-    fi
-    if [[ -z "$pr_number" ]]; then
-      pr_number=$(jq -r --arg r "$REPO" --arg b "$branch" '.[] | select(.repo == $r and .branch == $b and .status == "active") | .pr // empty' "$REGISTRY" | head -1)
-    fi
-
-    [[ -f "$worktree_path/.env" ]] || setup_worktree "$worktree_path" "$branch" "$port" "${pr_number:-}"
-
-    local state
-    state=$(detect_session_state "$project")
-    if [[ "$state" == "resume" ]]; then
-      info "Containers already running"
-    else
-      if [[ "$state" != "first_run" ]] && project_has_volumes "$project" && has_db; then
-        # --reset drops outright (explicit consent, no inner prompt). Without it,
-        # this is a DESTRUCTIVE confirm (default N): under WS_ASSUME_YES it
-        # auto-NOs, so a scripted attach PRESERVES the existing database.
-        if [[ -n "$reset" ]] || confirm "Database exists from a previous run. Drop and re-initialize?" N; then
-          compose_down "$project" "$worktree_path"; state="first_run"
-        fi
-      fi
-      compose_up "$project" "$worktree_path" "$port" "$state"
-    fi
-
-    # Register a reused-port session that isn't in the registry yet (e.g. a
-    # worktree that exists on disk but whose row was pruned). A newly allocated
-    # port was already registered under the lock above, so skip it then. The
-    # check-and-add is itself serialized so two attaches can't both append.
-    if [[ -z "$registered" ]]; then
-      with_registry_lock register_if_absent "$REPO" "$branch" "$project" "$port" "$worktree_path" "${pr_number:-null}"
-    fi
-
-    launch_tmux "${tmux_session}_${port}" "$worktree_path" "$project" "$port" "${pr_number:-}"
-    exit 0
-  fi
-
-  # ── New session — create worktree ──
-  info "Creating session for branch: $branch"
-
-  # Resolve the base ref for new worktrees, degrading gracefully when there is
-  # no 'origin' remote (local-only / GitLab / non-origin repos).
-  local base_ref
-  if git -C "$REPO_ROOT" remote get-url origin >/dev/null 2>&1; then
-    git -C "$REPO_ROOT" fetch origin >/dev/null 2>&1 || true
-    base_ref="origin/$main_branch"
+  local state
+  state=$(detect_session_state "$project")
+  if [[ "$state" == "resume" ]]; then
+    info "Containers already running"
   else
-    base_ref="$main_branch"
-  fi
-  if ! git -C "$REPO_ROOT" rev-parse --verify --quiet "$base_ref" >/dev/null 2>&1; then
-    base_ref="$main_branch"
-    git -C "$REPO_ROOT" rev-parse --verify --quiet "$base_ref" >/dev/null 2>&1 || base_ref="HEAD"
-  fi
-
-  if [[ -n "$new_name" ]]; then
-    git -C "$REPO_ROOT" worktree add -b "$branch" "$worktree_path" "$base_ref"
-  else
-    git -C "$REPO_ROOT" worktree add "$worktree_path" "$branch" 2>/dev/null || {
-      local stale_path
-      stale_path=$(git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null \
-        | awk -v b="$branch" '/^worktree /{p=$2} /^branch refs\/heads\//{if ($2 == "refs/heads/"b) print p}')
-      if [[ -n "$stale_path" && "$stale_path" != "$worktree_path" ]]; then
-        warn "Branch '$branch' is checked out in a stale worktree at: $stale_path"
-        if confirm "Remove stale worktree and continue?" Y; then
-          git -C "$REPO_ROOT" worktree remove --force "$stale_path" 2>/dev/null || true
-          git -C "$REPO_ROOT" worktree prune 2>/dev/null || true
-          git -C "$REPO_ROOT" worktree add "$worktree_path" "$branch" || { error "Still could not create worktree."; exit 1; }
-        else
-          error "Cannot create session — branch is checked out elsewhere."; exit 1
-        fi
-      else
-        error "Could not create worktree for '$branch'."; exit 1
+    if [[ "$state" != "first_run" ]] && project_has_volumes "$project" && has_db; then
+      # --reset drops outright (explicit consent, no inner prompt). Without it,
+      # this is a DESTRUCTIVE confirm (default N): under WS_ASSUME_YES it
+      # auto-NOs, so a scripted attach PRESERVES the existing database.
+      if [[ -n "$reset" ]] || confirm "Database exists from a previous run. Drop and re-initialize?" N; then
+        compose_down "$project" "$worktree_path"; state="first_run"
       fi
-    }
+    fi
+    compose_up "$project" "$worktree_path" "$port" "$state"
   fi
-  success "Worktree created at $worktree_path"
 
-  # Allocate the port AND register it atomically under the lock, BEFORE the long
-  # compose_up --wait, so a concurrent attach sees this port as taken and won't
-  # pick it. compose_up stays OUTSIDE the lock (it can wait up to 600s).
-  local port
-  port=$(with_registry_lock allocate_and_register \
-           "$REPO" "$branch" "$project" "$worktree_path" "${pr_number:-null}") || exit 1
-
-  setup_worktree "$worktree_path" "$branch" "$port" "${pr_number:-}"
-  compose_up "$project" "$worktree_path" "$port" "first_run"
-  # (registry_add removed here — already done under the lock above.)
+  # Register a reused-port session that isn't in the registry yet (e.g. a
+  # worktree that exists on disk but whose row was pruned). A newly allocated
+  # port was already registered under the lock above, so skip it then. The
+  # check-and-add is itself serialized so two attaches can't both append.
+  if [[ -z "$registered" ]]; then
+    with_registry_lock register_if_absent "$REPO" "$branch" "$project" "$port" "$worktree_path" "${pr_number:-null}"
+  fi
 
   header "Session Ready"
   echo -e "  ${BOLD}Repo:${NC}      $REPO"
@@ -739,14 +673,7 @@ cmd_rebuild() {
 
   info "Fetching latest $main_branch..."
   local src_ref
-  if git -C "$REPO_ROOT" remote get-url origin >/dev/null 2>&1; then
-    git -C "$REPO_ROOT" fetch origin >/dev/null 2>&1 || true
-    src_ref="origin/$main_branch"
-  else
-    src_ref="$main_branch"
-  fi
-  git -C "$REPO_ROOT" rev-parse --verify --quiet "$src_ref" >/dev/null 2>&1 || src_ref="$main_branch"
-  git -C "$REPO_ROOT" rev-parse --verify --quiet "$src_ref" >/dev/null 2>&1 || src_ref="HEAD"
+  src_ref=$(resolve_base_ref "$REPO_ROOT" "$main_branch")
 
   # build_ctx is intentionally NOT local: the EXIT trap fires in global scope,
   # where a function-local would be unset (fatal under set -u, and would leak

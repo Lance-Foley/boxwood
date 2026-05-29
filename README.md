@@ -56,6 +56,18 @@ that can't be automated: launching OrbStack, `gh auth login`, and optionally ins
 Claude Code. Those three — Docker, GitHub auth, and the Assistant — are the
 irreducibly-interactive parts; everything else is hands-off.
 
+### Updating
+
+```sh
+ws update
+```
+
+`ws update` self-updates the install (a `git pull --ff-only` on the `~/.boxwood`
+checkout `ws` was launched from). It refuses to run on a dirty tree or when the pull
+isn't a clean fast-forward, so local edits are never clobbered — resolve those manually
+with `git -C ~/.boxwood pull`. Running sessions are untouched; the new logic applies to
+your next `ws` invocation.
+
 ---
 
 ## Quick start
@@ -106,6 +118,7 @@ not the repo's recipe.
 | `ws rebuild` | Build/refresh this repo's golden base image from `main`. |
 | `ws exec <command>` | Run a command in the session's app container (`ws exec rails console`). |
 | `ws db-restore [--branch <name>]` | Re-run the repo's DB setup against a running session. |
+| `ws update` | Update boxwood itself (`git pull --ff-only` on the install checkout). |
 
 `attach` is the single entry point: it creates a session the first time and resumes it
 (reattaching tmux, restarting stopped containers) every time after.

@@ -61,6 +61,7 @@ output is controlled by env vars (`DOCKER_RUNNING`, `DOCKER_ANY`,
 | `unit.bats`    | `slugify`, `registry_add/end/prune`, `next_port`, `find_session_by_cwd`, `generate_compose`, `confirm` (incl. `WS_ASSUME_YES`) |
 | `docker.bats`  | `compose_status`, `detect_session_state`, `project_has_volumes`, `compose_project_name`, `compose_status_display` |
 | `config.bats`  | `load_config`, `cfg`/`cfg_default`, `has_db`, `load_user_config`, `ucfg`/`ucfg_default`, `resolve_assistant_command` |
+| `worktree.bats`| `resolve_base_ref`, `ensure_worktree` — git-worktree provisioning against **real throwaway repos** (detached-HEAD recovery, orphaned dir, branch checked out elsewhere, remoteless Base ref) |
 
 ## What is intentionally NOT unit-tested, and why
 
@@ -81,6 +82,11 @@ smoke harness** (`test/smoke.sh`) does exactly that end-to-end:
   `restore_command` in the live app container, verified by a durable run counter)
   are exercised there — not as Tier-1 units, which would have to stub the entire
   orchestration. `cmd_init` is scaffold-only and remains uncovered by either tier.
+  **Note:** the git-worktree provisioning that used to live inline in `cmd_attach`
+  (Base-ref resolution + the detached-HEAD / orphan / stale-worktree recovery state
+  machine) was extracted into `resolve_base_ref` / `ensure_worktree` and is now
+  unit-tested directly in `worktree.bats` against real throwaway repos — so those
+  edge cases no longer depend on the Docker smoke run to be exercised.
 - **`launch_tmux`** — `exec`s into `tmux`; the only unit-testable behavior is the
   early `WS_NO_ATTACH` short-circuit. The rest spawns panes and replaces the
   process, so it cannot be meaningfully asserted in a sourced shell.
