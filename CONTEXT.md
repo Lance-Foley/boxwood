@@ -1,11 +1,12 @@
 # ws — Work Session Orchestrator
 
-`ws` creates isolated, containerized development sessions for **any** repo. Each
-session is a git worktree + a per-session Docker Compose stack + a tmux layout +
-Claude Code context. A repo opts in by committing a `.ws/` directory describing its
-session recipe; `ws` itself is stack-agnostic. WescomApp is the first such repo —
-its `.ws/` produces a Rails app + Postgres + SolidQueue worker, the tool's original
-behavior. See `docs/superpowers/specs/2026-05-29-ws-generalization-design.md`.
+`ws` (the CLI for the **boxwood** project) creates isolated, containerized development
+sessions for **any** repo. Each session is a git worktree + a per-session Docker Compose
+stack + a tmux layout + Claude Code context. A repo opts in by committing a `.ws/`
+directory describing its session recipe; `ws` itself is stack-agnostic and ships a
+`rails-postgres` starter that `ws init` scaffolds. WescomApp adopts it by committing a
+`.ws/` that reproduces the tool's original behavior (Rails + Postgres + SolidQueue
+worker). See `docs/superpowers/specs/2026-05-29-ws-generalization-design.md`.
 
 ## Language
 

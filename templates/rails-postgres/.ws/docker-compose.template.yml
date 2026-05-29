@@ -1,8 +1,10 @@
+# Per-session stack. boxwood substitutes __HOST_PORT__, __WORKTREE_PATH__,
+# __REPO_ROOT__, and __DB_INIT__ when it generates the session's compose file.
 services:
   db:
-    image: pgvector/pgvector:pg17
+    image: postgres:17
     environment:
-      POSTGRES_DB: wescomapp
+      POSTGRES_DB: app_development
       POSTGRES_HOST_AUTH_METHOD: trust
     volumes:
       - pgdata:/var/lib/postgresql/data
@@ -13,12 +15,11 @@ services:
       retries: 10
 
   app:
-    image: wescomapp-dev:latest
-    # No `command:` override — the image CMD (foreman -f Procfile.dev) runs the dev
-    # server, so it self-heals on restart/crash. See docs/adr/0001.
+    image: app-dev:latest
+    # No `command:` override — the image CMD (foreman) runs the dev server, so it
+    # self-heals on restart. boxwood tails its logs rather than launching it.
     environment:
-      DATABASE_URL: postgres://postgres@db/wescomapp
-      SOLID_QUEUE_IN_PUMA: "false"
+      DATABASE_URL: postgres://postgres@db/app_development
       PORT: "__HOST_PORT__"
       BINDING: "0.0.0.0"
       DB_INIT: "__DB_INIT__"
@@ -26,7 +27,6 @@ services:
       - "__HOST_PORT__:__HOST_PORT__"
     volumes:
       - __WORKTREE_PATH__:/app
-      - __WESCOM_APP_PATH__/latest.dump:/dumps/latest.dump:ro
       - bundle_cache:/usr/local/bundle
       - node_cache:/app/node_modules
     depends_on:
@@ -37,6 +37,7 @@ services:
     stdin_open: true
     tty: true
     healthcheck:
+      # Healthy once first-run init wrote the marker, or when no init was requested.
       test: ["CMD-SHELL", "test -f /tmp/.db_initialized || test \"$DB_INIT\" != 'true'"]
       interval: 2s
       timeout: 5s
@@ -44,11 +45,10 @@ services:
       start_period: 5s
 
   worker:
-    image: wescomapp-dev:latest
+    image: app-dev:latest
     command: bundle exec rails solid_queue:start
     environment:
-      DATABASE_URL: postgres://postgres@db/wescomapp
-      SOLID_QUEUE_IN_PUMA: "false"
+      DATABASE_URL: postgres://postgres@db/app_development
       # Skip dependency reconciliation in the entrypoint (app already did it).
       WS_ROLE: worker
     volumes:

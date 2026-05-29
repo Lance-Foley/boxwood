@@ -3,15 +3,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo "ws — WescomApp Session Tool Installer"
+echo "boxwood — isolated containerized dev sessions (CLI: ws)"
 echo ""
 
-# Check prerequisites
+# Check prerequisites. gh is only needed for `ws attach --pr`, so it's optional.
 missing=()
-for cmd in git docker jq gh tmux claude; do
-  if ! command -v "$cmd" &>/dev/null; then
-    missing+=("$cmd")
-  fi
+for cmd in git docker jq ruby tmux claude; do
+  command -v "$cmd" &>/dev/null || missing+=("$cmd")
 done
 
 if [[ ${#missing[@]} -gt 0 ]]; then
@@ -20,7 +18,7 @@ if [[ ${#missing[@]} -gt 0 ]]; then
     case "$cmd" in
       docker)  echo "  $cmd — Install OrbStack: brew install orbstack" ;;
       jq)      echo "  $cmd — brew install jq" ;;
-      gh)      echo "  $cmd — brew install gh" ;;
+      ruby)    echo "  $cmd — preinstalled on macOS, or: brew install ruby (used to parse .ws/config.yml)" ;;
       tmux)    echo "  $cmd — brew install tmux" ;;
       claude)  echo "  $cmd — npm install -g @anthropic-ai/claude-code" ;;
       *)       echo "  $cmd" ;;
@@ -31,10 +29,11 @@ if [[ ${#missing[@]} -gt 0 ]]; then
   exit 1
 fi
 
-# Validate gh auth
-if ! gh auth status &>/dev/null; then
-  echo "GitHub CLI is not authenticated. Run: gh auth login"
-  exit 1
+# gh is optional (only for --pr); warn but don't block.
+if ! command -v gh &>/dev/null; then
+  echo "Note: gh not found — 'ws attach --pr' will be unavailable (brew install gh)."
+elif ! gh auth status &>/dev/null; then
+  echo "Note: gh is not authenticated — 'ws attach --pr' needs 'gh auth login'."
 fi
 
 # Validate Docker is running
@@ -43,10 +42,8 @@ if ! docker info > /dev/null 2>&1; then
   exit 1
 fi
 
-# Make ws executable
+# Make ws executable + symlink onto PATH
 chmod +x "$SCRIPT_DIR/ws"
-
-# Symlink
 if [[ -w "/usr/local/bin" ]]; then
   INSTALL_DIR="/usr/local/bin"
 else
@@ -55,11 +52,11 @@ else
 fi
 ln -sf "$SCRIPT_DIR/ws" "$INSTALL_DIR/ws"
 
+echo ""
 echo "Installed ws to $INSTALL_DIR/ws"
 echo ""
-echo "Environment (add to shell profile if not already set):"
-echo "  export WESCOM_APP_PATH=~/code/WescomApp          # default"
-echo ""
-echo "Next steps:"
-echo "  1. ws rebuild                         # Build the base Docker image"
-echo "  2. ws attach --new \"My first session\"  # Create your first session"
+echo "Next steps — in any repo you want sessions for:"
+echo "  1. cd /path/to/your-repo"
+echo "  2. ws init                           # scaffold .ws/ (edit it to taste, commit it)"
+echo "  3. ws rebuild                        # build the repo's base image"
+echo "  4. ws attach --new \"My first session\"  # create your first session"

@@ -1,7 +1,7 @@
 # ws Generalization: Repo-Agnostic Session Orchestrator
 
 **Date:** 2026-05-29
-**Status:** Draft
+**Status:** Implemented (2026-05-29)
 **Goal:** Turn `ws` from a WescomApp-specific tool into a generic, repo-agnostic
 orchestrator for isolated containerized dev sessions. Any repo can adopt it by
 committing a `.ws/` directory; WescomApp becomes the first such config and behaves

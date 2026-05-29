@@ -1,6 +1,8 @@
+# Golden base image for boxwood sessions (Rails + Postgres starter).
+# Adjust the Ruby version, system packages, and Node version to match your app.
 FROM ruby:3.4.4-slim-bookworm
 
-# System dependencies + PostgreSQL 17 client (for pg_restore compatibility with pg17 dumps)
+# System dependencies + PostgreSQL client (match your server's major version).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libpq-dev \
@@ -24,15 +26,15 @@ RUN npm install -g yarn
 
 WORKDIR /app
 
-# Pre-install gems from main branch (baked into image for speed)
+# Pre-install gems from main (baked into the image for speed)
 COPY Gemfile Gemfile.lock ./
 RUN bundle install --jobs 4
 
-# Pre-install node modules from main branch
+# Pre-install node modules from main
 COPY package.json yarn.lock ./
 RUN yarn install --frozen-lockfile
 
-# Install foreman (used by bin/dev to run Procfile.dev: web + css)
+# foreman runs Procfile.dev (web + asset watcher)
 RUN gem install foreman
 
 # Entrypoint handles dependency drift and DB init; db-init.sh is the shared
@@ -41,5 +43,5 @@ COPY docker-entrypoint.sh db-init.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh /usr/local/bin/db-init.sh
 ENTRYPOINT ["docker-entrypoint.sh"]
 
-# Default: run the dev server via foreman (Puma + Tailwind watcher)
+# Default: the app container owns the dev server (self-heals on restart).
 CMD ["foreman", "start", "-f", "Procfile.dev"]
