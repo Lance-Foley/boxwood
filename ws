@@ -19,6 +19,7 @@ source "$SCRIPT_DIR/lib/docker.sh"
 : "${WS_HOME:=$HOME/.ws}"
 SESSIONS_DIR="$WS_HOME/sessions"
 REGISTRY="$WS_HOME/registry.json"
+REGISTRY_LOCK="$WS_HOME/registry.lock"
 
 mkdir -p "$SESSIONS_DIR"
 [[ -f "$REGISTRY" ]] || echo '[]' > "$REGISTRY"
@@ -30,6 +31,97 @@ REPO_ROOT=""; REPO=""; CONFIG=""; CONFIG_JSON=""
 
 slugify() {
   echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's|/|-|g; s/[^a-z0-9-]/-/g; s/--*/-/g; s/^-//; s/-$//' | cut -c1-50
+}
+
+# ─── Registry mutex ─────────────────────────────────────────────────────────
+# Portable, dependency-free mutex serializing every registry read-modify-write
+# (port allocation + registration, ending a session, pruning). `mkdir` is atomic
+# on every POSIX filesystem, needs no extra dependency, and is `set -e` safe —
+# macOS ships no util-linux `flock`, so this deliberately avoids it.
+#
+# The locked region is now milliseconds (compose_up's up-to-600s --wait stays
+# OUTSIDE the lock), so a SHORT stale timeout is safe: a crashed holder is reaped
+# quickly. Release happens on EVERY exit path via explicit acquire → body →
+# release (see with_registry_lock). A process-level EXIT/INT/TERM trap (set once
+# in the main dispatch guard) is the safety net for an abrupt kill; release_lock
+# is PID-guarded so it can never remove a DIFFERENT process's lock. A RETURN trap
+# is intentionally NOT used: under bats `set -eET` (functrace) it fires on nested
+# returns and would release the lock mid-body.
+WS_LOCK_TIMEOUT="${WS_LOCK_TIMEOUT:-30}"   # seconds to wait before giving up
+WS_LOCK_STALE="${WS_LOCK_STALE:-15}"       # seconds before a held lock is deemed stale
+
+# Echo the mtime (epoch seconds) of "$1", or empty if neither stat flavor works.
+# macOS: `stat -f %m`; GNU/Linux: `stat -c %Y`. On a host with neither, callers
+# fail safe (treat the lock as fresh — never reap something we cannot age).
+_lock_mtime() {
+  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo ""
+}
+
+acquire_lock() {
+  local waited=0 age now mtime
+  until mkdir "$REGISTRY_LOCK" 2>/dev/null; do
+    # Reap a stale lock left by a crashed holder. Fail safe: if we cannot read
+    # the mtime (no usable `stat`), do NOT reap — wait/time out instead.
+    if [[ -d "$REGISTRY_LOCK" ]]; then
+      now=$(date +%s)
+      mtime=$(_lock_mtime "$REGISTRY_LOCK")
+      if [[ -n "$mtime" ]]; then
+        age=$(( now - mtime ))
+        if (( age > WS_LOCK_STALE )); then
+          # To stderr: acquire_lock runs inside command substitution
+          # (port=$(with_registry_lock allocate_and_register ...)), so any stdout
+          # here would corrupt the captured port.
+          warn "Removing stale registry lock (held ${age}s)." >&2
+          rm -rf "$REGISTRY_LOCK"
+          continue
+        fi
+      fi
+    fi
+    if (( waited >= WS_LOCK_TIMEOUT )); then
+      error "Could not acquire registry lock after ${WS_LOCK_TIMEOUT}s (another 'ws' may be busy)."
+      return 1
+    fi
+    sleep 1; waited=$(( waited + 1 ))
+  done
+  # Record ownership so the safety-net trap (and release_lock) only ever remove
+  # a lock we still hold — never one a different process re-acquired.
+  echo "$$" > "$REGISTRY_LOCK/pid" 2>/dev/null || true
+  return 0
+}
+
+# Idempotent: removing an already-removed lock, or a lock now owned by another
+# process, is a no-op. Safe to call from a trap and multiple times.
+release_lock() {
+  [[ -d "$REGISTRY_LOCK" ]] || return 0
+  local owner
+  owner=$(cat "$REGISTRY_LOCK/pid" 2>/dev/null || echo "")
+  # Only remove if it's ours (or has no recorded owner — a partially-created lock).
+  if [[ -z "$owner" || "$owner" == "$$" ]]; then
+    rm -rf "$REGISTRY_LOCK" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# Run a command while holding the registry lock; release on EVERY exit path.
+# compose_up MUST NOT be passed here — it belongs outside the lock (it can wait
+# up to 600s). Usage: with_registry_lock <fn> [args...]
+#
+# Release is EXPLICIT (acquire → body → release): bash's `|| rc=$?` guarantees
+# the explicit release runs whether the body succeeds or fails. We deliberately
+# do NOT manipulate traps in here:
+#   * A `trap ... RETURN` would fire on nested returns under bats `set -eET`
+#     (functrace) and release the lock mid-body.
+#   * Saving/restoring the EXIT trap per call collides with bats' own EXIT trap.
+# The abrupt-exit safety net (an EXIT/INT/TERM trap calling release_lock) is set
+# ONCE at process start in the main dispatch guard below — never under bats,
+# which sources this file without running the guard. release_lock is idempotent
+# and PID-guarded, so that net is a clean no-op when no lock is held.
+with_registry_lock() {
+  acquire_lock || return 1
+  local rc=0
+  "$@" || rc=$?
+  release_lock
+  return $rc
 }
 
 registry_add() {
@@ -71,6 +163,30 @@ next_port() {
   done
   error "All session ports ($lo-$hi) are in use. Run 'ws end' to free one."
   return 1
+}
+
+# Atomically pick the lowest free port AND record the session, so a concurrent
+# 'ws attach' sees the port as taken before this one releases. Echoes the chosen
+# port. MUST be called under the lock (via with_registry_lock) — calling it bare
+# reintroduces the check-then-act race it exists to close.
+allocate_and_register() {
+  local repo="$1" branch="$2" project="$3" path="$4" pr="${5:-null}"
+  local port
+  port=$(next_port) || return 1
+  registry_add "$repo" "$branch" "$project" "$port" "$path" "$pr"
+  echo "$port"
+}
+
+# Append a session row iff no active row for this repo+branch already exists, in
+# one locked read-modify-write so two concurrent resumes cannot both append.
+# Used on the resume path when a session reuses a port but has no registry row.
+# MUST be called under the lock (via with_registry_lock).
+register_if_absent() {
+  local repo="$1" branch="$2" project="$3" port="$4" path="$5" pr="${6:-null}"
+  local in_registry
+  in_registry=$(jq -r --arg r "$repo" --arg b "$branch" '.[] | select(.repo == $r and .branch == $b and .status == "active") | .branch' "$REGISTRY" | head -1)
+  [[ -z "$in_registry" ]] && registry_add "$repo" "$branch" "$project" "$port" "$path" "$pr"
+  return 0
 }
 
 find_session_by_cwd() {
@@ -300,7 +416,7 @@ cmd_attach() {
     exit 1
   fi
 
-  registry_prune
+  with_registry_lock registry_prune
 
   # Resolve branch from PR
   if [[ -n "$pr_number" ]]; then
@@ -366,9 +482,18 @@ cmd_attach() {
       fi
     fi
 
-    local port
+    # Reuse the port already recorded for this session; only allocate a NEW one
+    # when none exists. A freshly allocated port is registered atomically under
+    # the lock (allocate_and_register), so a concurrent attach sees it as taken
+    # before we release. `registered` tracks whether that already happened, so
+    # the post-compose_up guard below never appends a duplicate row.
+    local port registered=""
     port=$(jq -r --arg r "$REPO" --arg b "$branch" '.[] | select(.repo == $r and .branch == $b and .status == "active") | .port' "$REGISTRY" | head -1)
-    if [[ -z "$port" || "$port" == "null" ]]; then port=$(next_port) || exit 1; fi
+    if [[ -z "$port" || "$port" == "null" ]]; then
+      port=$(with_registry_lock allocate_and_register \
+               "$REPO" "$branch" "$project" "$worktree_path" "${pr_number:-null}") || exit 1
+      registered=1
+    fi
     if [[ -z "$pr_number" ]]; then
       pr_number=$(jq -r --arg r "$REPO" --arg b "$branch" '.[] | select(.repo == $r and .branch == $b and .status == "active") | .pr // empty' "$REGISTRY" | head -1)
     fi
@@ -391,9 +516,13 @@ cmd_attach() {
       compose_up "$project" "$worktree_path" "$port" "$state"
     fi
 
-    local in_registry
-    in_registry=$(jq -r --arg r "$REPO" --arg b "$branch" '.[] | select(.repo == $r and .branch == $b and .status == "active") | .branch' "$REGISTRY" | head -1)
-    [[ -z "$in_registry" ]] && registry_add "$REPO" "$branch" "$project" "$port" "$worktree_path" "${pr_number:-null}"
+    # Register a reused-port session that isn't in the registry yet (e.g. a
+    # worktree that exists on disk but whose row was pruned). A newly allocated
+    # port was already registered under the lock above, so skip it then. The
+    # check-and-add is itself serialized so two attaches can't both append.
+    if [[ -z "$registered" ]]; then
+      with_registry_lock register_if_absent "$REPO" "$branch" "$project" "$port" "$worktree_path" "${pr_number:-null}"
+    fi
 
     launch_tmux "${tmux_session}_${port}" "$worktree_path" "$project" "$port" "${pr_number:-}"
     exit 0
@@ -439,11 +568,16 @@ cmd_attach() {
   fi
   success "Worktree created at $worktree_path"
 
-  local port; port=$(next_port) || exit 1
+  # Allocate the port AND register it atomically under the lock, BEFORE the long
+  # compose_up --wait, so a concurrent attach sees this port as taken and won't
+  # pick it. compose_up stays OUTSIDE the lock (it can wait up to 600s).
+  local port
+  port=$(with_registry_lock allocate_and_register \
+           "$REPO" "$branch" "$project" "$worktree_path" "${pr_number:-null}") || exit 1
 
   setup_worktree "$worktree_path" "$branch" "$port" "${pr_number:-}"
   compose_up "$project" "$worktree_path" "$port" "first_run"
-  registry_add "$REPO" "$branch" "$project" "$port" "$worktree_path" "${pr_number:-null}"
+  # (registry_add removed here — already done under the lock above.)
 
   header "Session Ready"
   echo -e "  ${BOLD}Repo:${NC}      $REPO"
@@ -572,7 +706,9 @@ cmd_end() {
     echo ""
   fi
 
-  registry_end "$REPO" "$branch"
+  # Serialize the registry write under the same lock that guards allocation, so
+  # ending a session and a concurrent allocate-and-register never interleave.
+  with_registry_lock registry_end "$REPO" "$branch"
   success "Session ended: $branch"
 
   tmux kill-session -t "${project}_${port}" 2>/dev/null \
@@ -738,6 +874,14 @@ EOF
 
 # Guarded so the script can be sourced for unit testing without dispatching.
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  # Process-level safety net: if `ws` is killed or exits abruptly while holding
+  # the registry lock, release it. release_lock is idempotent and PID-guarded,
+  # so this is a no-op when no lock is held and can never remove another
+  # process's lock. Set here (not inside with_registry_lock) so it never fires
+  # under bats — which sources this file without running this guard — and never
+  # collides with cmd_rebuild's own build_ctx EXIT trap (rebuild takes no lock).
+  trap 'release_lock' EXIT INT TERM
+
   case "${1:-}" in
     init)       shift; cmd_init "$@" ;;
     attach)     shift; cmd_attach "$@" ;;
