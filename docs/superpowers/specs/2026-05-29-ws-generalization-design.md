@@ -117,7 +117,31 @@ The project/repo is renamed accordingly (`ws` / `worksession`), shedding the Wes
 
 ## Open questions / deferred
 
-- Only Rails+Postgres is proven. Truly different stacks (no DB, non-Ruby, multiple
-  app services) are *enabled* by this design but not yet exercised.
-- `ws init` starter content and how much it auto-detects from the repo (Gemfile present →
-  Rails starter, etc.) is TBD.
+Several of the original open questions are now decided (see
+[`docs/adr/0003`](../../adr/0003-agnostic-engine-per-user-config.md)):
+
+- **Runtime dependency — decided.** The engine carries no language runtime: config is
+  parsed with `yq -o=json`, not Ruby. Required deps are `git docker tmux jq yq`; Ruby
+  drops off entirely.
+- **Per-user config layer — decided.** Editor and Assistant are no longer hardcoded
+  (`nvim`/RubyMine/`claude`) and no longer committed in the per-repo recipe. They live
+  in a per-user `~/.ws/config.yml` (`editor`, `gui_editor`, `assistant.command`/
+  `skip_permissions`) that follows the developer across every repo. The committed `.ws/`
+  recipe describes the *stack*; the per-user config describes the *developer*.
+- **Installer — decided (Mac-only).** A remote one-liner
+  (`bash -c "$(curl -fsSL …/install.sh)"`) bootstraps Homebrew, installs the dep set +
+  OrbStack, clones to `~/.boxwood`, symlinks `ws`, and runs a short interactive tail.
+  The *engine* stays Linux-clean (POSIX commands) so a Linux installer is additive
+  later, but only the macOS installer ships now.
+- **`gh` / GitHub coupling — decided.** `gh` is optional (only `--pr` needs it); the
+  one-time `gh auth login` moves into the installer. `cmd_attach`'s `git fetch origin` /
+  `origin/$main_branch` degrades gracefully for remote-less or non-`origin` repos.
+
+Genuinely remaining:
+
+- **Linux installer.** Deferred, not blocked — the engine is already Linux-clean, so this
+  is additive (brew → apt/dnf, `open` → `xdg-open`) whenever a Linux user appears.
+- **`ws init` stack auto-detection.** Starter content ships as the Rails+Postgres set,
+  but how much `init` infers from the repo (Gemfile present → Rails starter, etc.) is
+  still TBD. Truly different stacks (no DB, non-Ruby, multiple app services) are
+  *enabled* by the design but not yet exercised.

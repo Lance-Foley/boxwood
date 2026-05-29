@@ -1,0 +1,26 @@
+# .ws/config.yml — Tier-2 smoke fixture (no database).
+# Exercises boxwood's has_db=false path with a minimal alpine image.
+version: 1
+
+main_branch: main
+
+image:
+  name: boxwood-smoke:latest
+  dockerfile: .ws/Dockerfile
+  # No dependency files to bake in — keeps `ws rebuild` to a few seconds and
+  # avoids any read from origin/main.
+  build_context_from_main: []
+
+compose:
+  template: .ws/docker-compose.template.yml
+  app_service: app
+  ready: healthcheck
+
+ports:
+  # Deliberately offset from the real 3000-3005 pool so smoke runs never clash
+  # with live sessions.
+  range: [3100, 3105]
+
+secrets_file: .env
+
+# No db block (has_db=false) and no claude block.

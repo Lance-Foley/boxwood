@@ -80,6 +80,21 @@ find_session_by_cwd() {
   ' "$REGISTRY" | head -1
 }
 
+# Resolve the Assistant command from the per-user config.
+#   key absent          → "claude" (default)
+#   key present, blank  → ""        (plain shell)
+#   key present, value  → that value
+# Caller must have run load_user_config first.
+resolve_assistant_command() {
+  local has_key
+  has_key=$(echo "$USER_CONFIG_JSON" | jq -r 'try (.assistant | has("command")) catch false' 2>/dev/null)
+  if [[ "$has_key" == "true" ]]; then
+    ucfg '.assistant.command'
+  else
+    echo "claude"
+  fi
+}
+
 setup_worktree() {
   local worktree_path="$1" branch="$2" port="$3" pr="${4:-}"
 
@@ -93,7 +108,18 @@ setup_worktree() {
 
   mkdir -p "$worktree_path/.session/memory"
 
-  cat >> "$worktree_path/CLAUDE.md" <<EOF
+  # Where the session-context block lands depends on the Assistant: Claude reads
+  # CLAUDE.md, anything else (or no assistant) gets a neutral .session/CONTEXT.md.
+  load_user_config
+  local assistant context_file
+  assistant=$(resolve_assistant_command)
+  if [[ "$assistant" == *claude* ]]; then
+    context_file="CLAUDE.md"
+  else
+    context_file=".session/CONTEXT.md"
+  fi
+
+  cat >> "$worktree_path/$context_file" <<EOF
 
 # Session Context
 - Repo: $REPO
@@ -112,18 +138,33 @@ EOF
   local git_dir
   git_dir=$(git -C "$worktree_path" rev-parse --git-dir)
   mkdir -p "$git_dir/info"
-  for f in CLAUDE.md .session/ .env docker-compose.yml; do
+  for f in "$context_file" .session/ .env docker-compose.yml; do
     grep -qxF "$f" "$git_dir/info/exclude" 2>/dev/null || echo "$f" >> "$git_dir/info/exclude"
   done
 }
 
 launch_tmux() {
+  if [[ -n "${WS_NO_ATTACH:-}" ]]; then return 0; fi
+
   local full_session="$1" worktree_path="$2" project="$3" port="$4" pr_number="$5"
 
-  local app_service claude_cmd
+  local app_service editor assistant_cmd skipperm
   app_service=$(cfg_default '.compose.app_service' 'app')
-  claude_cmd="claude"
-  [[ "$(cfg '.claude.skip_permissions')" == "true" ]] && claude_cmd="claude --dangerously-skip-permissions"
+
+  # In-tmux editor: per-user config → $EDITOR → nvim.
+  load_user_config
+  editor=$(ucfg '.editor')
+  [[ -z "$editor" ]] && editor="${EDITOR:-}"
+  [[ -z "$editor" ]] && editor="nvim"
+
+  # Assistant pane: per-user config (key absent → claude; blank → plain shell).
+  assistant_cmd=$(resolve_assistant_command)
+  skipperm=$(ucfg '.assistant.skip_permissions')
+  if [[ -z "$assistant_cmd" ]]; then
+    assistant_cmd="bash"
+  elif [[ "$assistant_cmd" == *claude* && "$skipperm" == "true" ]]; then
+    assistant_cmd="$assistant_cmd --dangerously-skip-permissions"
+  fi
 
   # Ghostty tab title
   local tab_title="localhost:${port}"
@@ -132,7 +173,9 @@ launch_tmux() {
   fi
   printf '\033]0;%s\007' "$tab_title"
 
-  open -a "RubyMine" "$worktree_path" 2>/dev/null &
+  # External GUI editor: only if the per-user config names one.
+  local gui; gui=$(ucfg '.gui_editor')
+  [[ -n "$gui" ]] && open -a "$gui" "$worktree_path" 2>/dev/null &
 
   if tmux has-session -t "$full_session" 2>/dev/null; then
     info "Reattaching to tmux session: $full_session"
@@ -163,8 +206,8 @@ launch_tmux() {
   pane_shell=$(tmux split-window -h -t "$pane_dev" -c "$worktree_path" -P -F '#{pane_id}')
 
   local compose="docker compose -p $project -f $worktree_path/docker-compose.yml"
-  tmux send-keys -t "$pane_nvim" "nvim ." Enter
-  tmux send-keys -t "$pane_claude" "$claude_cmd" Enter
+  tmux send-keys -t "$pane_nvim" "$editor ." Enter
+  tmux send-keys -t "$pane_claude" "$assistant_cmd" Enter
   tmux send-keys -t "$pane_dev" "$compose logs -f $app_service" Enter
   tmux send-keys -t "$pane_shell" "$compose exec $app_service bash" Enter
   tmux select-pane -t "$pane_nvim"
@@ -335,10 +378,23 @@ cmd_attach() {
 
   # ── New session — create worktree ──
   info "Creating session for branch: $branch"
-  git -C "$REPO_ROOT" fetch origin
+
+  # Resolve the base ref for new worktrees, degrading gracefully when there is
+  # no 'origin' remote (local-only / GitLab / non-origin repos).
+  local base_ref
+  if git -C "$REPO_ROOT" remote get-url origin >/dev/null 2>&1; then
+    git -C "$REPO_ROOT" fetch origin >/dev/null 2>&1 || true
+    base_ref="origin/$main_branch"
+  else
+    base_ref="$main_branch"
+  fi
+  if ! git -C "$REPO_ROOT" rev-parse --verify --quiet "$base_ref" >/dev/null 2>&1; then
+    base_ref="$main_branch"
+    git -C "$REPO_ROOT" rev-parse --verify --quiet "$base_ref" >/dev/null 2>&1 || base_ref="HEAD"
+  fi
 
   if [[ -n "$new_name" ]]; then
-    git -C "$REPO_ROOT" worktree add -b "$branch" "$worktree_path" "origin/$main_branch"
+    git -C "$REPO_ROOT" worktree add -b "$branch" "$worktree_path" "$base_ref"
   else
     git -C "$REPO_ROOT" worktree add "$worktree_path" "$branch" 2>/dev/null || {
       local stale_path
@@ -510,19 +566,30 @@ cmd_rebuild() {
   [[ -f "$REPO_ROOT/$dockerfile" ]] || { error "Dockerfile not found: $REPO_ROOT/$dockerfile"; exit 1; }
 
   info "Fetching latest $main_branch..."
-  git -C "$REPO_ROOT" fetch origin
+  local src_ref
+  if git -C "$REPO_ROOT" remote get-url origin >/dev/null 2>&1; then
+    git -C "$REPO_ROOT" fetch origin >/dev/null 2>&1 || true
+    src_ref="origin/$main_branch"
+  else
+    src_ref="$main_branch"
+  fi
+  git -C "$REPO_ROOT" rev-parse --verify --quiet "$src_ref" >/dev/null 2>&1 || src_ref="$main_branch"
+  git -C "$REPO_ROOT" rev-parse --verify --quiet "$src_ref" >/dev/null 2>&1 || src_ref="HEAD"
 
-  local build_ctx; build_ctx=$(mktemp -d)
-  trap 'rm -rf "$build_ctx"' EXIT
+  # build_ctx is intentionally NOT local: the EXIT trap fires in global scope,
+  # where a function-local would be unset (fatal under set -u, and would leak
+  # the temp dir). The guard keeps the trap safe even if mktemp never ran.
+  build_ctx=$(mktemp -d)
+  trap 'rm -rf "${build_ctx:-}" 2>/dev/null' EXIT
 
-  # Copy dependency files from origin/<main_branch> into the build context root.
-  info "Copying dependency files from origin/$main_branch..."
+  # Copy dependency files from <src_ref> into the build context root.
+  info "Copying dependency files from $src_ref..."
   local f
   while IFS= read -r f; do
     [[ -z "$f" ]] && continue
     mkdir -p "$build_ctx/$(dirname "$f")"
-    git -C "$REPO_ROOT" show "origin/$main_branch:$f" > "$build_ctx/$f" 2>/dev/null || {
-      error "Could not read '$f' from origin/$main_branch"; exit 1
+    git -C "$REPO_ROOT" show "$src_ref:$f" > "$build_ctx/$f" 2>/dev/null || {
+      error "Could not read '$f' from $src_ref"; exit 1
     }
   done < <(echo "$CONFIG_JSON" | jq -r '.image.build_context_from_main[]?')
 
@@ -629,14 +696,17 @@ EOF
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
-case "${1:-}" in
-  init)       shift; cmd_init "$@" ;;
-  attach)     shift; cmd_attach "$@" ;;
-  list)       shift; cmd_list "$@" ;;
-  end)        shift; cmd_end "$@" ;;
-  rebuild)    cmd_rebuild ;;
-  exec)       shift; cmd_exec "$@" ;;
-  db-restore) shift; cmd_db_restore "$@" ;;
-  -h|--help|help) usage ;;
-  *)          usage ;;
-esac
+# Guarded so the script can be sourced for unit testing without dispatching.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  case "${1:-}" in
+    init)       shift; cmd_init "$@" ;;
+    attach)     shift; cmd_attach "$@" ;;
+    list)       shift; cmd_list "$@" ;;
+    end)        shift; cmd_end "$@" ;;
+    rebuild)    cmd_rebuild ;;
+    exec)       shift; cmd_exec "$@" ;;
+    db-restore) shift; cmd_db_restore "$@" ;;
+    -h|--help|help) usage ;;
+    *)          usage ;;
+  esac
+fi

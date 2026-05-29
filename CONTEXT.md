@@ -16,13 +16,30 @@ its session recipe in a committed `.ws/` directory. `ws` detects the current pro
 from `$PWD`.
 _Avoid_: app, target (use Project)
 
-**`.ws/`**:
+**`.ws/`** (per-Project recipe):
 The committed per-project recipe: `config.yml` + `Dockerfile` + compose template +
 entrypoint + optional `db-init.sh`. Owned by the Project, read by the orchestrator.
+Describes the *stack* — never the developer's editor or assistant (those are
+**Per-user config**).
+
+**Per-user config (`~/.ws/config.yml`)**:
+The developer's own preferences, applied across every Project and never committed:
+in-tmux editor, external GUI editor, and the **Assistant** command. Falls back to
+`$EDITOR` when unset. The **`.ws/`** recipe describes the *stack*; the per-user config
+describes the *developer*.
+_Avoid_: settings, global config (it is per-user preference, not machine state — that's the **Registry**)
+
+**Assistant**:
+The AI tool launched in the session's top-right tmux pane — Claude Code by default
+(`assistant.command: claude`), declared in the **Per-user config** and skippable
+(empty → a plain shell). Generalized from the original hardcoded `claude:` block.
+_Avoid_: Claude (the Assistant is tool-agnostic; Claude is merely the default)
 
 **Orchestrator**:
 `ws` itself — the stack-agnostic engine (worktrees, ports, registry, tmux, lifecycle,
-Claude context). Knows nothing about Rails or any specific stack.
+**Assistant** context). Knows nothing about Rails, any specific stack, language
+runtime, or editor. Carries no language-runtime dependency of its own (config is
+parsed with `yq`, not Ruby); only the installer is platform-specific (macOS).
 
 **Session**:
 One unit of work within a Project — a git worktree under

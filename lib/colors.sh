@@ -21,6 +21,10 @@ dim()     { echo -e "${DIM}$*${NC}"; }
 confirm() {
   local prompt="${1:-Continue?}"
   echo -en "${YELLOW}${prompt} [y/N]${NC} "
+  if [[ -n "${WS_ASSUME_YES:-}" ]]; then
+    echo ""
+    return 0
+  fi
   read -r reply
   [[ "$reply" =~ ^[Yy]$ ]]
 }

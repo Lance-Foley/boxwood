@@ -1,0 +1,26 @@
+# Per-session stack for the no-DB smoke fixture. boxwood substitutes
+# __HOST_PORT__, __WORKTREE_PATH__, and __DB_INIT__ when it generates the
+# session's docker-compose.yml. There is intentionally NO db service here:
+# this exercises boxwood's has_db=false / no-named-volume path.
+services:
+  app:
+    image: boxwood-smoke:latest
+    environment:
+      PORT: "__HOST_PORT__"
+      DB_INIT: "__DB_INIT__"
+    ports:
+      - "__HOST_PORT__:__HOST_PORT__"
+    volumes:
+      - __WORKTREE_PATH__:/app
+    env_file:
+      - __WORKTREE_PATH__/.env
+    healthcheck:
+      # Healthy once first-run init wrote the marker, or when no init was requested.
+      test: ["CMD-SHELL", "test -f /tmp/.db_initialized || test \"$DB_INIT\" != 'true'"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+      start_period: 1s
+
+# No named volumes: only the worktree bind mount above. This keeps
+# project_has_volumes() false so the DB-drop prompt never fires.
