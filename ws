@@ -14,11 +14,13 @@ SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
 source "$SCRIPT_DIR/lib/colors.sh"
 source "$SCRIPT_DIR/lib/config.sh"
 source "$SCRIPT_DIR/lib/docker.sh"
+source "$SCRIPT_DIR/lib/worktree.sh"
 
 # ─── boxwood home ─────────────────────────────────────────────────────────────
 : "${WS_HOME:=$HOME/.ws}"
 SESSIONS_DIR="$WS_HOME/sessions"
 REGISTRY="$WS_HOME/registry.json"
+REGISTRY_LOCK="$WS_HOME/registry.lock"
 
 mkdir -p "$SESSIONS_DIR"
 [[ -f "$REGISTRY" ]] || echo '[]' > "$REGISTRY"
@@ -30,6 +32,97 @@ REPO_ROOT=""; REPO=""; CONFIG=""; CONFIG_JSON=""
 
 slugify() {
   echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's|/|-|g; s/[^a-z0-9-]/-/g; s/--*/-/g; s/^-//; s/-$//' | cut -c1-50
+}
+
+# ─── Registry mutex ─────────────────────────────────────────────────────────
+# Portable, dependency-free mutex serializing every registry read-modify-write
+# (port allocation + registration, ending a session, pruning). `mkdir` is atomic
+# on every POSIX filesystem, needs no extra dependency, and is `set -e` safe —
+# macOS ships no util-linux `flock`, so this deliberately avoids it.
+#
+# The locked region is now milliseconds (compose_up's up-to-600s --wait stays
+# OUTSIDE the lock), so a SHORT stale timeout is safe: a crashed holder is reaped
+# quickly. Release happens on EVERY exit path via explicit acquire → body →
+# release (see with_registry_lock). A process-level EXIT/INT/TERM trap (set once
+# in the main dispatch guard) is the safety net for an abrupt kill; release_lock
+# is PID-guarded so it can never remove a DIFFERENT process's lock. A RETURN trap
+# is intentionally NOT used: under bats `set -eET` (functrace) it fires on nested
+# returns and would release the lock mid-body.
+WS_LOCK_TIMEOUT="${WS_LOCK_TIMEOUT:-30}"   # seconds to wait before giving up
+WS_LOCK_STALE="${WS_LOCK_STALE:-15}"       # seconds before a held lock is deemed stale
+
+# Echo the mtime (epoch seconds) of "$1", or empty if neither stat flavor works.
+# macOS: `stat -f %m`; GNU/Linux: `stat -c %Y`. On a host with neither, callers
+# fail safe (treat the lock as fresh — never reap something we cannot age).
+_lock_mtime() {
+  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo ""
+}
+
+acquire_lock() {
+  local waited=0 age now mtime
+  until mkdir "$REGISTRY_LOCK" 2>/dev/null; do
+    # Reap a stale lock left by a crashed holder. Fail safe: if we cannot read
+    # the mtime (no usable `stat`), do NOT reap — wait/time out instead.
+    if [[ -d "$REGISTRY_LOCK" ]]; then
+      now=$(date +%s)
+      mtime=$(_lock_mtime "$REGISTRY_LOCK")
+      if [[ -n "$mtime" ]]; then
+        age=$(( now - mtime ))
+        if (( age > WS_LOCK_STALE )); then
+          # To stderr: acquire_lock runs inside command substitution
+          # (port=$(with_registry_lock allocate_and_register ...)), so any stdout
+          # here would corrupt the captured port.
+          warn "Removing stale registry lock (held ${age}s)." >&2
+          rm -rf "$REGISTRY_LOCK"
+          continue
+        fi
+      fi
+    fi
+    if (( waited >= WS_LOCK_TIMEOUT )); then
+      error "Could not acquire registry lock after ${WS_LOCK_TIMEOUT}s (another 'ws' may be busy)."
+      return 1
+    fi
+    sleep 1; waited=$(( waited + 1 ))
+  done
+  # Record ownership so the safety-net trap (and release_lock) only ever remove
+  # a lock we still hold — never one a different process re-acquired.
+  echo "$$" > "$REGISTRY_LOCK/pid" 2>/dev/null || true
+  return 0
+}
+
+# Idempotent: removing an already-removed lock, or a lock now owned by another
+# process, is a no-op. Safe to call from a trap and multiple times.
+release_lock() {
+  [[ -d "$REGISTRY_LOCK" ]] || return 0
+  local owner
+  owner=$(cat "$REGISTRY_LOCK/pid" 2>/dev/null || echo "")
+  # Only remove if it's ours (or has no recorded owner — a partially-created lock).
+  if [[ -z "$owner" || "$owner" == "$$" ]]; then
+    rm -rf "$REGISTRY_LOCK" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# Run a command while holding the registry lock; release on EVERY exit path.
+# compose_up MUST NOT be passed here — it belongs outside the lock (it can wait
+# up to 600s). Usage: with_registry_lock <fn> [args...]
+#
+# Release is EXPLICIT (acquire → body → release): bash's `|| rc=$?` guarantees
+# the explicit release runs whether the body succeeds or fails. We deliberately
+# do NOT manipulate traps in here:
+#   * A `trap ... RETURN` would fire on nested returns under bats `set -eET`
+#     (functrace) and release the lock mid-body.
+#   * Saving/restoring the EXIT trap per call collides with bats' own EXIT trap.
+# The abrupt-exit safety net (an EXIT/INT/TERM trap calling release_lock) is set
+# ONCE at process start in the main dispatch guard below — never under bats,
+# which sources this file without running the guard. release_lock is idempotent
+# and PID-guarded, so that net is a clean no-op when no lock is held.
+with_registry_lock() {
+  acquire_lock || return 1
+  local rc=0
+  "$@" || rc=$?
+  release_lock
+  return $rc
 }
 
 registry_add() {
@@ -52,7 +145,15 @@ registry_end() {
 
 registry_prune() {
   local cutoff tmp
-  cutoff=$(date -v-30d +"%Y-%m-%d" 2>/dev/null || date -d "30 days ago" +"%Y-%m-%d")
+  cutoff=$(date -v-30d +"%Y-%m-%d" 2>/dev/null || date -d "30 days ago" +"%Y-%m-%d" 2>/dev/null) || true
+  # On a host where neither date form works, cutoff is empty. Running jq with an
+  # empty cutoff makes `.started > ""` true for every entry by accident — undefined
+  # behavior. Fail safe: keep all entries (no data loss) and let a later attach on
+  # a healthy host prune normally.
+  if [[ -z "$cutoff" ]]; then
+    warn "registry_prune: could not compute a 30-day cutoff (no compatible 'date') — skipping prune."
+    return 0
+  fi
   tmp=$(mktemp)
   jq --arg c "$cutoff" \
      '[.[] | select(.status == "active" or .started > $c)]' \
@@ -71,6 +172,30 @@ next_port() {
   done
   error "All session ports ($lo-$hi) are in use. Run 'ws end' to free one."
   return 1
+}
+
+# Atomically pick the lowest free port AND record the session, so a concurrent
+# 'ws attach' sees the port as taken before this one releases. Echoes the chosen
+# port. MUST be called under the lock (via with_registry_lock) — calling it bare
+# reintroduces the check-then-act race it exists to close.
+allocate_and_register() {
+  local repo="$1" branch="$2" project="$3" path="$4" pr="${5:-null}"
+  local port
+  port=$(next_port) || return 1
+  registry_add "$repo" "$branch" "$project" "$port" "$path" "$pr"
+  echo "$port"
+}
+
+# Append a session row iff no active row for this repo+branch already exists, in
+# one locked read-modify-write so two concurrent resumes cannot both append.
+# Used on the resume path when a session reuses a port but has no registry row.
+# MUST be called under the lock (via with_registry_lock).
+register_if_absent() {
+  local repo="$1" branch="$2" project="$3" port="$4" path="$5" pr="${6:-null}"
+  local in_registry
+  in_registry=$(jq -r --arg r "$repo" --arg b "$branch" '.[] | select(.repo == $r and .branch == $b and .status == "active") | .branch' "$REGISTRY" | head -1)
+  [[ -z "$in_registry" ]] && registry_add "$repo" "$branch" "$project" "$port" "$path" "$pr"
+  return 0
 }
 
 find_session_by_cwd() {
@@ -300,7 +425,7 @@ cmd_attach() {
     exit 1
   fi
 
-  registry_prune
+  with_registry_lock registry_prune
 
   # Resolve branch from PR
   if [[ -n "$pr_number" ]]; then
@@ -336,114 +461,65 @@ cmd_attach() {
     exit 1
   fi
 
-  # Clean up an orphaned (non-worktree) directory
-  if [[ -d "$worktree_path" ]] && ! git -C "$worktree_path" rev-parse --git-dir > /dev/null 2>&1; then
-    warn "Orphaned directory found at $worktree_path — removing..."
-    rm -rf "$worktree_path"
-    git -C "$REPO_ROOT" worktree prune 2>/dev/null || true
+  # Provision the worktree (one seam for every git edge case — orphaned dir,
+  # detached HEAD, branch parked in a stale worktree). On return it exists at
+  # $worktree_path on $branch, or we've already failed loudly. The Base ref is
+  # resolved only when actually creating a NEW branch (--new on a path that
+  # doesn't exist yet), so a resume never triggers a git fetch.
+  local base_ref=""
+  if [[ -n "$new_name" && ! -d "$worktree_path" ]]; then
+    base_ref=$(resolve_base_ref "$REPO_ROOT" "$main_branch")
+  fi
+  ensure_worktree "$REPO_ROOT" "$worktree_path" "$branch" "$base_ref" || exit 1
+
+  # ── From here the create and resume paths are identical: the Registry decides
+  #    the port, and the pgdata volume (not the Registry) decides the DB
+  #    lifecycle. A brand-new worktree has no containers/volume, so
+  #    detect_session_state returns first_run and the drop-DB confirm is skipped. ──
+
+  # Reuse the port already recorded for this session; allocate a NEW one only
+  # when none exists. A freshly allocated port is registered atomically under
+  # the lock (allocate_and_register), so a concurrent attach sees it as taken
+  # before we release. `registered` tracks whether that already happened, so
+  # the post-compose_up guard below never appends a duplicate row.
+  local port registered=""
+  port=$(jq -r --arg r "$REPO" --arg b "$branch" '.[] | select(.repo == $r and .branch == $b and .status == "active") | .port' "$REGISTRY" | head -1)
+  if [[ -z "$port" || "$port" == "null" ]]; then
+    port=$(with_registry_lock allocate_and_register \
+             "$REPO" "$branch" "$project" "$worktree_path" "${pr_number:-null}") || exit 1
+    registered=1
+  fi
+  if [[ -z "$pr_number" ]]; then
+    pr_number=$(jq -r --arg r "$REPO" --arg b "$branch" '.[] | select(.repo == $r and .branch == $b and .status == "active") | .pr // empty' "$REGISTRY" | head -1)
   fi
 
-  # ── Resume / restart an existing worktree ──
-  if [[ -d "$worktree_path" ]]; then
-    info "Existing worktree found at $worktree_path"
+  # First-time setup of this worktree dir (idempotent: skipped once .env exists,
+  # so a resume never re-appends the session-context block).
+  [[ -f "$worktree_path/.env" ]] || setup_worktree "$worktree_path" "$branch" "$port" "${pr_number:-}"
 
-    local current_head
-    current_head=$(git -C "$worktree_path" symbolic-ref --short HEAD 2>/dev/null || echo "DETACHED")
-    if [[ "$current_head" == "DETACHED" ]]; then
-      warn "Worktree is in detached HEAD state — attempting to fix..."
-      if git -C "$worktree_path" checkout "$branch" 2>/dev/null; then
-        success "Now tracking branch: $branch"
-      elif git -C "$worktree_path" checkout -b "$branch" "origin/$branch" 2>/dev/null; then
-        success "Created and tracking: $branch"
-      else
-        warn "Automatic checkout failed."
-      fi
-      # Re-verify: never launch a session in detached HEAD (commits there are lost).
-      if ! git -C "$worktree_path" symbolic-ref --short HEAD >/dev/null 2>&1; then
-        error "Worktree at $worktree_path is still in detached HEAD; refusing to launch."
-        error "Fix manually: git -C \"$worktree_path\" checkout $branch"
-        exit 1
-      fi
-    fi
-
-    local port
-    port=$(jq -r --arg r "$REPO" --arg b "$branch" '.[] | select(.repo == $r and .branch == $b and .status == "active") | .port' "$REGISTRY" | head -1)
-    if [[ -z "$port" || "$port" == "null" ]]; then port=$(next_port) || exit 1; fi
-    if [[ -z "$pr_number" ]]; then
-      pr_number=$(jq -r --arg r "$REPO" --arg b "$branch" '.[] | select(.repo == $r and .branch == $b and .status == "active") | .pr // empty' "$REGISTRY" | head -1)
-    fi
-
-    [[ -f "$worktree_path/.env" ]] || setup_worktree "$worktree_path" "$branch" "$port" "${pr_number:-}"
-
-    local state
-    state=$(detect_session_state "$project")
-    if [[ "$state" == "resume" ]]; then
-      info "Containers already running"
-    else
-      if [[ "$state" != "first_run" ]] && project_has_volumes "$project" && has_db; then
-        # --reset drops outright (explicit consent, no inner prompt). Without it,
-        # this is a DESTRUCTIVE confirm (default N): under WS_ASSUME_YES it
-        # auto-NOs, so a scripted attach PRESERVES the existing database.
-        if [[ -n "$reset" ]] || confirm "Database exists from a previous run. Drop and re-initialize?" N; then
-          compose_down "$project" "$worktree_path"; state="first_run"
-        fi
-      fi
-      compose_up "$project" "$worktree_path" "$port" "$state"
-    fi
-
-    local in_registry
-    in_registry=$(jq -r --arg r "$REPO" --arg b "$branch" '.[] | select(.repo == $r and .branch == $b and .status == "active") | .branch' "$REGISTRY" | head -1)
-    [[ -z "$in_registry" ]] && registry_add "$REPO" "$branch" "$project" "$port" "$worktree_path" "${pr_number:-null}"
-
-    launch_tmux "${tmux_session}_${port}" "$worktree_path" "$project" "$port" "${pr_number:-}"
-    exit 0
-  fi
-
-  # ── New session — create worktree ──
-  info "Creating session for branch: $branch"
-
-  # Resolve the base ref for new worktrees, degrading gracefully when there is
-  # no 'origin' remote (local-only / GitLab / non-origin repos).
-  local base_ref
-  if git -C "$REPO_ROOT" remote get-url origin >/dev/null 2>&1; then
-    git -C "$REPO_ROOT" fetch origin >/dev/null 2>&1 || true
-    base_ref="origin/$main_branch"
+  local state
+  state=$(detect_session_state "$project")
+  if [[ "$state" == "resume" ]]; then
+    info "Containers already running"
   else
-    base_ref="$main_branch"
-  fi
-  if ! git -C "$REPO_ROOT" rev-parse --verify --quiet "$base_ref" >/dev/null 2>&1; then
-    base_ref="$main_branch"
-    git -C "$REPO_ROOT" rev-parse --verify --quiet "$base_ref" >/dev/null 2>&1 || base_ref="HEAD"
-  fi
-
-  if [[ -n "$new_name" ]]; then
-    git -C "$REPO_ROOT" worktree add -b "$branch" "$worktree_path" "$base_ref"
-  else
-    git -C "$REPO_ROOT" worktree add "$worktree_path" "$branch" 2>/dev/null || {
-      local stale_path
-      stale_path=$(git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null \
-        | awk -v b="$branch" '/^worktree /{p=$2} /^branch refs\/heads\//{if ($2 == "refs/heads/"b) print p}')
-      if [[ -n "$stale_path" && "$stale_path" != "$worktree_path" ]]; then
-        warn "Branch '$branch' is checked out in a stale worktree at: $stale_path"
-        if confirm "Remove stale worktree and continue?" Y; then
-          git -C "$REPO_ROOT" worktree remove --force "$stale_path" 2>/dev/null || true
-          git -C "$REPO_ROOT" worktree prune 2>/dev/null || true
-          git -C "$REPO_ROOT" worktree add "$worktree_path" "$branch" || { error "Still could not create worktree."; exit 1; }
-        else
-          error "Cannot create session — branch is checked out elsewhere."; exit 1
-        fi
-      else
-        error "Could not create worktree for '$branch'."; exit 1
+    if [[ "$state" != "first_run" ]] && project_has_volumes "$project" && has_db; then
+      # --reset drops outright (explicit consent, no inner prompt). Without it,
+      # this is a DESTRUCTIVE confirm (default N): under WS_ASSUME_YES it
+      # auto-NOs, so a scripted attach PRESERVES the existing database.
+      if [[ -n "$reset" ]] || confirm "Database exists from a previous run. Drop and re-initialize?" N; then
+        compose_down "$project" "$worktree_path"; state="first_run"
       fi
-    }
+    fi
+    compose_up "$project" "$worktree_path" "$port" "$state"
   fi
-  success "Worktree created at $worktree_path"
 
-  local port; port=$(next_port) || exit 1
-
-  setup_worktree "$worktree_path" "$branch" "$port" "${pr_number:-}"
-  compose_up "$project" "$worktree_path" "$port" "first_run"
-  registry_add "$REPO" "$branch" "$project" "$port" "$worktree_path" "${pr_number:-null}"
+  # Register a reused-port session that isn't in the registry yet (e.g. a
+  # worktree that exists on disk but whose row was pruned). A newly allocated
+  # port was already registered under the lock above, so skip it then. The
+  # check-and-add is itself serialized so two attaches can't both append.
+  if [[ -z "$registered" ]]; then
+    with_registry_lock register_if_absent "$REPO" "$branch" "$project" "$port" "$worktree_path" "${pr_number:-null}"
+  fi
 
   header "Session Ready"
   echo -e "  ${BOLD}Repo:${NC}      $REPO"
@@ -572,7 +648,9 @@ cmd_end() {
     echo ""
   fi
 
-  registry_end "$REPO" "$branch"
+  # Serialize the registry write under the same lock that guards allocation, so
+  # ending a session and a concurrent allocate-and-register never interleave.
+  with_registry_lock registry_end "$REPO" "$branch"
   success "Session ended: $branch"
 
   tmux kill-session -t "${project}_${port}" 2>/dev/null \
@@ -595,14 +673,7 @@ cmd_rebuild() {
 
   info "Fetching latest $main_branch..."
   local src_ref
-  if git -C "$REPO_ROOT" remote get-url origin >/dev/null 2>&1; then
-    git -C "$REPO_ROOT" fetch origin >/dev/null 2>&1 || true
-    src_ref="origin/$main_branch"
-  else
-    src_ref="$main_branch"
-  fi
-  git -C "$REPO_ROOT" rev-parse --verify --quiet "$src_ref" >/dev/null 2>&1 || src_ref="$main_branch"
-  git -C "$REPO_ROOT" rev-parse --verify --quiet "$src_ref" >/dev/null 2>&1 || src_ref="HEAD"
+  src_ref=$(resolve_base_ref "$REPO_ROOT" "$main_branch")
 
   # build_ctx is intentionally NOT local: the EXIT trap fires in global scope,
   # where a function-local would be unset (fatal under set -u, and would leak
@@ -677,15 +748,31 @@ cmd_db_restore() {
     [[ -z "$branch" ]] && { error "Not in a session directory. Use --branch <name>."; exit 1; }
   fi
 
-  local repo_slug dir_name project worktree_path app_service restore_cmd
+  local repo_slug dir_name project worktree_path app_service db_service restore_cmd
   repo_slug=$(slugify "$REPO"); dir_name=$(slugify "$branch")
   project=$(compose_project_name "$repo_slug" "$dir_name")
   worktree_path="$SESSIONS_DIR/$REPO/$dir_name"
   app_service=$(cfg_default '.compose.app_service' 'app')
+  db_service=$(cfg_default '.compose.db_service' 'db')
   restore_cmd=$(cfg '.db.restore_command')
+
+  # An empty restore_command would make `sh -c ""` a silent no-op that still
+  # reports success — refuse rather than pretend the database was reset.
+  if [[ -z "$restore_cmd" ]]; then
+    error "db.restore_command is empty in .ws/config.yml — nothing to run."; exit 1
+  fi
 
   if [[ "$(compose_status "$project")" != "running" ]]; then
     error "Containers not running for '$branch'. Run 'ws attach --branch $branch' first."; exit 1
+  fi
+
+  # The restore command typically waits on the db (e.g. pg_isready) with NO
+  # timeout, so a down/unhealthy db turns the restore into a silent hang. Assert
+  # the db service is up and healthy first, with an actionable error.
+  if ! service_healthy "$project" "$db_service"; then
+    error "Database service '$db_service' is not running and healthy for '$branch'."
+    error "Bring the session up first: ws attach --branch $branch"
+    exit 1
   fi
 
   warn "This will reset the session database via: $restore_cmd"
@@ -697,9 +784,44 @@ cmd_db_restore() {
   fi
 
   info "Restoring database..."
+  # restore_command is a shell command line (not an argv): run it through one
+  # shell inside the container so quoting / pipelines / env-prefixes survive.
+  # sh is guaranteed present; a login shell (bash -lc) would be the wrong model.
   # set -e propagates a non-zero exit straight out of ws.
-  docker compose -p "$project" -f "$worktree_path/docker-compose.yml" exec "$app_service" $restore_cmd
+  docker compose -p "$project" -f "$worktree_path/docker-compose.yml" exec "$app_service" sh -c "$restore_cmd"
   success "Database restore complete"
+}
+
+# ─── ws update ────────────────────────────────────────────────────────────────
+
+cmd_update() {
+  header "Updating boxwood"
+
+  # SCRIPT_DIR is the real install dir (symlinks already resolved at the top).
+  if ! git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+    error "$SCRIPT_DIR is not a git checkout — cannot self-update."
+    error "Reinstall or update boxwood manually."
+    exit 1
+  fi
+
+  local branch
+  branch=$(git -C "$SCRIPT_DIR" symbolic-ref --short HEAD 2>/dev/null || echo "DETACHED")
+
+  # Refuse to pull onto a dirty tree: --ff-only would still complain, but a clear
+  # up-front message beats a cryptic git error, and protects local edits.
+  if [[ -n "$(git -C "$SCRIPT_DIR" status --porcelain 2>/dev/null)" ]]; then
+    error "working tree dirty — commit/stash in $SCRIPT_DIR first (branch: $branch)."
+    exit 1
+  fi
+
+  info "Pulling latest on '$branch' in $SCRIPT_DIR..."
+  if git -C "$SCRIPT_DIR" pull --ff-only; then
+    success "boxwood updated (branch: $branch)."
+  else
+    error "Update failed on '$branch' (not a fast-forward, or diverged from upstream)."
+    error "Resolve manually: git -C $SCRIPT_DIR pull"
+    exit 1
+  fi
 }
 
 # ─── Usage ────────────────────────────────────────────────────────────────────
@@ -718,6 +840,7 @@ ${BOLD}Usage:${NC}
   ws rebuild                               Build/refresh this repo's base image
   ws exec <command>                        Run a command in the session container
   ws db-restore [--branch <name>] [--yes]  Re-run the repo's DB setup
+  ws update                                Update boxwood itself (git pull --ff-only)
 
 ${BOLD}Flags:${NC}
   --reset      (attach) Drop an existing session DB volume and re-initialize.
@@ -738,6 +861,14 @@ EOF
 
 # Guarded so the script can be sourced for unit testing without dispatching.
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  # Process-level safety net: if `ws` is killed or exits abruptly while holding
+  # the registry lock, release it. release_lock is idempotent and PID-guarded,
+  # so this is a no-op when no lock is held and can never remove another
+  # process's lock. Set here (not inside with_registry_lock) so it never fires
+  # under bats — which sources this file without running this guard — and never
+  # collides with cmd_rebuild's own build_ctx EXIT trap (rebuild takes no lock).
+  trap 'release_lock' EXIT INT TERM
+
   case "${1:-}" in
     init)       shift; cmd_init "$@" ;;
     attach)     shift; cmd_attach "$@" ;;
@@ -746,6 +877,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     rebuild)    cmd_rebuild ;;
     exec)       shift; cmd_exec "$@" ;;
     db-restore) shift; cmd_db_restore "$@" ;;
+    update)     cmd_update ;;
     -h|--help|help) usage ;;
     *)          usage ;;
   esac

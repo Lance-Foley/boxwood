@@ -61,19 +61,32 @@ output is controlled by env vars (`DOCKER_RUNNING`, `DOCKER_ANY`,
 | `unit.bats`    | `slugify`, `registry_add/end/prune`, `next_port`, `find_session_by_cwd`, `generate_compose`, `confirm` (incl. `WS_ASSUME_YES`) |
 | `docker.bats`  | `compose_status`, `detect_session_state`, `project_has_volumes`, `compose_project_name`, `compose_status_display` |
 | `config.bats`  | `load_config`, `cfg`/`cfg_default`, `has_db`, `load_user_config`, `ucfg`/`ucfg_default`, `resolve_assistant_command` |
+| `worktree.bats`| `resolve_base_ref`, `ensure_worktree` — git-worktree provisioning against **real throwaway repos** (detached-HEAD recovery, orphaned dir, branch checked out elsewhere, remoteless Base ref) |
 
 ## What is intentionally NOT unit-tested, and why
 
 These functions are dominated by side effects (process exec, real `git`/`tmux`/
 `docker` orchestration) and have little pure logic to assert in isolation. They
-are better covered by integration tests against real tooling:
+are better covered by integration tests against real tooling — and the **Tier-2
+smoke harness** (`test/smoke.sh`) does exactly that end-to-end:
 
-- **`cmd_attach`, `cmd_end`, `cmd_init`, `cmd_rebuild`, `cmd_exec`,
-  `cmd_db_restore`, `cmd_list`** — top-level command flows. They wire together
-  `git worktree`, `docker compose`, `gh`, the registry, and `tmux`, and most
-  branches `exit`. Their pure pieces (slugify, registry, port allocation, state
-  detection) are unit-tested individually above; the orchestration itself wants
-  an integration harness with real repos/containers.
+- **`cmd_attach`, `cmd_end`, `cmd_rebuild`, `cmd_exec`, `cmd_db_restore`,
+  `cmd_list`** — top-level command flows. They wire together `git worktree`,
+  `docker compose`, `gh`, the registry, and `tmux`, and most branches `exit`.
+  Their pure pieces (slugify, registry, port allocation, state detection) are
+  unit-tested individually above; the orchestration itself is covered by
+  `test/smoke.sh`, which drives `attach --new/--branch/--pr`, `rebuild`, `list`,
+  `exec`, `db-restore`, and `end` against real fixtures and containers.
+  Specifically, `attach --pr` (its `gh pr view … | jq -r '.headRefName'` branch
+  resolution, via a PATH-shimmed `gh`) and `db-restore` (re-running the repo's
+  `restore_command` in the live app container, verified by a durable run counter)
+  are exercised there — not as Tier-1 units, which would have to stub the entire
+  orchestration. `cmd_init` is scaffold-only and remains uncovered by either tier.
+  **Note:** the git-worktree provisioning that used to live inline in `cmd_attach`
+  (Base-ref resolution + the detached-HEAD / orphan / stale-worktree recovery state
+  machine) was extracted into `resolve_base_ref` / `ensure_worktree` and is now
+  unit-tested directly in `worktree.bats` against real throwaway repos — so those
+  edge cases no longer depend on the Docker smoke run to be exercised.
 - **`launch_tmux`** — `exec`s into `tmux`; the only unit-testable behavior is the
   early `WS_NO_ATTACH` short-circuit. The rest spawns panes and replaces the
   process, so it cannot be meaningfully asserted in a sourced shell.
