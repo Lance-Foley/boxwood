@@ -129,20 +129,11 @@ PROJECT="$(project_name "$REPO_NAME" "$BRANCH")"
 PROJECTS+=("$PROJECT")
 
 # ── (c) rebuild ─────────────────────────────────────────────────────────────────
-# NOTE: `ws rebuild` runs `git fetch origin` unconditionally (no `|| true`), so a
-# truly remote-less repo aborts rebuild under `set -e`. The remote-less hardening
-# the spec validates only covers attach/end. To keep the lifecycle test green we
-# attach a self-referential `origin` JUST for rebuild, then drop it so attach/end
-# run with NO remote as intended. (See concerns: rebuild should gain `|| true`.)
+# rebuild is run against a genuinely remote-less repo: `ws rebuild` guards its
+# `git fetch origin` behind an origin check (and `|| true`), and `build_ctx` is a
+# global cleaned by a guarded EXIT trap, so rebuild succeeds and exits 0 here.
 step "(c) ws rebuild (no-DB) — builds boxwood-smoke:latest"
-git -C "$REPO" remote add origin "$REPO/.git"
-git -C "$REPO" fetch origin >/dev/null 2>&1 || true
-# NOTE: `ws rebuild` currently exits non-zero on success because its EXIT trap
-# (`rm -rf "$build_ctx"`) dereferences a function-local under `set -u` after the
-# function has returned. The build itself succeeds, so we assert on the image —
-# which is exactly the assertion the spec specifies for this step. (See concerns.)
-( cd "$REPO" && "$WS" rebuild ) || true
-git -C "$REPO" remote remove origin
+( cd "$REPO" && "$WS" rebuild ) || fail "ws rebuild (no-DB) failed"
 docker image inspect boxwood-smoke:latest >/dev/null 2>&1 \
   || fail "boxwood-smoke:latest not present after rebuild"
 pass "image boxwood-smoke:latest built (remote-less attach/end to follow)"
@@ -199,6 +190,64 @@ step "(h) ws end --branch $BRANCH --no-push — teardown"
   || fail "registry status not 'ended' (got: $(registry_status "$REPO_NAME" "$BRANCH"))"
 pass "no containers, worktree gone, registry entry 'ended'"
 
+# ── (j) attach --pr — gh branch resolution ──────────────────────────────────────
+# Covers the only path that shells out to `gh`: `cmd_attach` resolves a PR number
+# to a branch via `gh pr view <n> --json headRefName | jq -r '.headRefName'`, then
+# attaches that branch. A PATH-prepended `gh` stub feeds canned JSON; because the
+# harness invokes the engine via its absolute path ("$WS"), the stub only shadows
+# the `gh` that `ws` itself spawns — exactly the seam we want.
+step "(j) ws attach --pr 7 — resolves headRefName via gh, then attaches"
+PR_REPO_NAME="boxwood-smoke-pr"
+PR_BRANCH="pr-seven"
+PR_REPO="$(make_repo "$FIXTURE_NODB" "$PR_REPO_NAME")"
+PR_PROJECT="$(project_name "$PR_REPO_NAME" "$PR_BRANCH")"
+PROJECTS+=("$PR_PROJECT")
+
+# This fixture pins image.name to boxwood-smoke:latest, built in phase 1. `ws end`
+# removes containers/volumes but NOT the base image, so it survives; rebuild only
+# if it somehow doesn't.
+docker image inspect boxwood-smoke:latest >/dev/null 2>&1 \
+  || ( cd "$PR_REPO" && "$WS" rebuild ) || fail "ws rebuild for --pr phase failed"
+
+# The branch the PR "points at" must exist locally for the worktree checkout to
+# succeed (remote-less repo). Create it off main.
+git -C "$PR_REPO" branch "$PR_BRANCH" main
+
+# PATH-shim gh to emit exactly what `gh pr view <n> --json headRefName` returns.
+GH_STUB_DIR="$(mktemp -d)"; TMP_DIRS+=("$GH_STUB_DIR")
+cat > "$GH_STUB_DIR/gh" <<SH
+#!/usr/bin/env bash
+# Minimal gh stub: only supports \`gh pr view <n> --json headRefName\`.
+if [[ "\$1" == "pr" && "\$2" == "view" ]]; then
+  echo '{"headRefName":"$PR_BRANCH"}'
+  exit 0
+fi
+exit 1
+SH
+chmod +x "$GH_STUB_DIR/gh"
+
+( cd "$PR_REPO" && PATH="$GH_STUB_DIR:$PATH" "$WS" attach --pr 7 ) \
+  || fail "attach --pr failed"
+
+PR_WORKTREE="$WS_HOME/sessions/$PR_REPO_NAME/$(slugify "$PR_BRANCH")"
+[[ -d "$PR_WORKTREE" ]] \
+  || fail "attach --pr did not create worktree for resolved branch $PR_BRANCH"
+[[ "$(active_count "$PR_REPO_NAME" "$PR_BRANCH")" == "1" ]] \
+  || fail "attach --pr: expected 1 active entry for $PR_BRANCH, got $(active_count "$PR_REPO_NAME" "$PR_BRANCH")"
+# The PR number should be recorded on the registry entry (first-run path passes
+# pr_number through to registry_add as a JSON number; `jq -r` prints it as 7).
+[[ "$(jq -r --arg r "$PR_REPO_NAME" --arg b "$PR_BRANCH" \
+   '.[] | select(.repo==$r and .branch==$b and .status=="active") | .pr' "$WS_HOME/registry.json" | head -1)" == "7" ]] \
+  || fail "attach --pr: registry .pr not 7"
+pass "gh resolved PR #7 → $PR_BRANCH; worktree + active entry created, pr=7 recorded"
+
+( cd "$PR_REPO" && "$WS" end --branch "$PR_BRANCH" --no-push ) || fail "attach --pr cleanup end failed"
+[[ "$(project_container_count "$PR_PROJECT")" -eq 0 ]] \
+  || fail "attach --pr cleanup: project $PR_PROJECT still has containers after end"
+[[ "$(registry_status "$PR_REPO_NAME" "$PR_BRANCH")" == "ended" ]] \
+  || fail "attach --pr cleanup: registry status not 'ended'"
+pass "attach --pr session torn down (no containers, entry 'ended')"
+
 # ════════════════════════════════════════════════════════════════════════════════
 # Phase 2 — with-DB fixture: minimal first_run + end
 # ════════════════════════════════════════════════════════════════════════════════
@@ -209,12 +258,7 @@ DB_PROJECT="$(project_name "$DB_REPO_NAME" "$DB_BRANCH")"
 PROJECTS+=("$DB_PROJECT")
 
 step "(i) with-DB: rebuild + attach --new + end (has_db + pgdata volume + db-init wait)"
-git -C "$DB_REPO" remote add origin "$DB_REPO/.git"
-git -C "$DB_REPO" fetch origin >/dev/null 2>&1 || true
-# `ws rebuild` exits non-zero on success (see the (c) note / concerns); assert
-# on the resulting image rather than the exit code.
-( cd "$DB_REPO" && "$WS" rebuild ) || true
-git -C "$DB_REPO" remote remove origin
+( cd "$DB_REPO" && "$WS" rebuild ) || fail "ws rebuild (with-DB) failed"
 docker image inspect boxwood-smoke-db:latest >/dev/null 2>&1 \
   || fail "boxwood-smoke-db:latest not present after rebuild"
 
@@ -240,6 +284,33 @@ docker compose -p "$DB_PROJECT" ps --status running --services 2>/dev/null | gre
 docker volume ls -q --filter "name=^${DB_PROJECT}_" | grep -q . \
   || fail "with-DB: no named volume for $DB_PROJECT (pgdata not created)"
 pass "with-DB first_run: app+db healthy (db-init wait completed), pgdata volume present"
+
+# ── (k) db-restore --yes — re-run the repo's DB setup against the live session ───
+# db-init.sh keeps a durable run counter at /app/.db_init_count, and /app is the
+# bind-mounted worktree, so the counter is readable here on the host and survives
+# the app-container recreation after first_run. first_run ran db-init once → "1".
+# A successful `ws db-restore` must re-run db-init and bump it to "2": we assert
+# the counter ACTUALLY changed (not just exit 0), per the spec's "don't trust the
+# exit code" requirement. --yes is required: without it db-restore auto-NOs under
+# WS_ASSUME_YES (DESTRUCTIVE confirm, default N) and no-ops.
+step "(k) ws db-restore --yes --branch $DB_BRANCH — re-runs restore_command in the app container"
+DB_COUNT_FILE="$DB_WORKTREE/.db_init_count"
+[[ "$(cat "$DB_COUNT_FILE" 2>/dev/null || echo 0)" == "1" ]] \
+  || fail "db-restore precondition: expected db-init run counter 1 after first_run, got $(cat "$DB_COUNT_FILE" 2>/dev/null || echo 0)"
+RESTORE_OUT="$( cd "$DB_REPO" && "$WS" db-restore --yes --branch "$DB_BRANCH" 2>&1 )" \
+  || fail "ws db-restore --yes failed (exit non-zero): $RESTORE_OUT"
+# db-init's observable stdout proves it ran inside the container.
+echo "$RESTORE_OUT" | grep -q 'ready (db-init run #2)' \
+  || fail "db-restore: db-init did not re-run (missing 'ready (db-init run #2)' in output: $RESTORE_OUT)"
+# Durable counter must have advanced 1 → 2 (restore actually re-ran db-init).
+[[ "$(cat "$DB_COUNT_FILE" 2>/dev/null || echo 0)" == "2" ]] \
+  || fail "db-restore: run counter did not advance to 2 (got $(cat "$DB_COUNT_FILE" 2>/dev/null || echo 0)); restore did not actually run"
+# Restore must not tear anything down: app+db still running, registry unchanged.
+[[ "$(project_running_count "$DB_PROJECT")" -ge 2 ]] \
+  || fail "db-restore: app+db not both running afterward, got $(project_running_count "$DB_PROJECT")"
+[[ "$(active_count "$DB_REPO_NAME" "$DB_BRANCH")" == "1" ]] \
+  || fail "db-restore altered the active entry count (got $(active_count "$DB_REPO_NAME" "$DB_BRANCH"))"
+pass "db-restore re-ran db-init (counter 1→2, 'ready' emitted); app+db still running, registry unchanged"
 
 ( cd "$DB_REPO" && "$WS" end --branch "$DB_BRANCH" --no-push ) || fail "with-DB end failed"
 [[ "$(project_container_count "$DB_PROJECT")" -eq 0 ]] || fail "with-DB project still has containers"
