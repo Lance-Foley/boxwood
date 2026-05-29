@@ -1,24 +1,44 @@
-# ws — WescomApp Session Manager
+# ws — Work Session Orchestrator
 
-`ws` creates isolated, containerized development sessions for the WescomApp Rails
-repo. Each session is a git worktree + a per-session Docker Compose stack
-(Postgres + Rails app + SolidQueue worker) + a tmux layout + Claude Code context.
+`ws` creates isolated, containerized development sessions for **any** repo. Each
+session is a git worktree + a per-session Docker Compose stack + a tmux layout +
+Claude Code context. A repo opts in by committing a `.ws/` directory describing its
+session recipe; `ws` itself is stack-agnostic. WescomApp is the first such repo —
+its `.ws/` produces a Rails app + Postgres + SolidQueue worker, the tool's original
+behavior. See `docs/superpowers/specs/2026-05-29-ws-generalization-design.md`.
 
 ## Language
 
+**Project**:
+A repo that has adopted `ws`, identified by its git toplevel and basename. Declares
+its session recipe in a committed `.ws/` directory. `ws` detects the current project
+from `$PWD`.
+_Avoid_: app, target (use Project)
+
+**`.ws/`**:
+The committed per-project recipe: `config.yml` + `Dockerfile` + compose template +
+entrypoint + optional `db-init.sh`. Owned by the Project, read by the orchestrator.
+
+**Orchestrator**:
+`ws` itself — the stack-agnostic engine (worktrees, ports, registry, tmux, lifecycle,
+Claude context). Knows nothing about Rails or any specific stack.
+
 **Session**:
-One unit of work — a git worktree, its dedicated Compose project, database volume,
-host port, and tmux session. Identified by branch name.
+One unit of work within a Project — a git worktree under
+`~/.ws/sessions/<repo>/<branch>/`, its dedicated Compose project, volumes, host port,
+and tmux session. Identified by branch name.
 _Avoid_: environment, instance, workspace
 
 **Registry**:
-`~/.wescom-sessions.json` — the record of sessions and their metadata (branch, port,
-path, pr, started, status). Source of truth for `ws list` and port allocation.
+`~/.ws/registry.json` — the record of sessions across all Projects and their metadata
+(repo, branch, port, path, pr, started, status). Source of truth for `ws list` and
+port allocation; `ws list` filters to the current Project by default.
 _Avoid_: session file, database (the registry is not the DB)
 
 **Golden base image**:
-`wescomapp-dev:latest`, built by `ws rebuild` from `origin/main`'s lockfiles. Gems and
-node modules are baked in; app code, DB data, and secrets are not.
+A Project's dev base image (e.g. `wescomapp-dev:latest`), built by `ws rebuild` from the
+Project's `.ws/Dockerfile` using lockfiles pulled from its `main_branch`. Dependencies
+are baked in; app code, DB data, and secrets are not.
 _Avoid_: dev image, base container
 
 **Dependency drift**:
