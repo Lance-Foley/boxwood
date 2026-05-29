@@ -92,3 +92,41 @@ setup() {
   run compose_status_display "ws-repo-feat"
   [[ "$output" == *"no containers"* ]]
 }
+
+# ─── service_health_ok (pure JSON parser behind service_healthy) ───────────────
+# Fed one `docker compose ps --format json` object; no docker call involved.
+
+@test "service_health_ok: running + healthy is OK" {
+  run service_health_ok '{"Name":"db","State":"running","Health":"healthy"}'
+  [ "$status" -eq 0 ]
+}
+
+@test "service_health_ok: running with no Health field is OK (no healthcheck)" {
+  run service_health_ok '{"Name":"db","State":"running"}'
+  [ "$status" -eq 0 ]
+}
+
+@test "service_health_ok: running but starting is rejected" {
+  run service_health_ok '{"Name":"db","State":"running","Health":"starting"}'
+  [ "$status" -ne 0 ]
+}
+
+@test "service_health_ok: running but unhealthy is rejected" {
+  run service_health_ok '{"Name":"db","State":"running","Health":"unhealthy"}'
+  [ "$status" -ne 0 ]
+}
+
+@test "service_health_ok: non-running state is rejected" {
+  run service_health_ok '{"Name":"db","State":"exited"}'
+  [ "$status" -ne 0 ]
+}
+
+@test "service_health_ok: empty input is rejected" {
+  run service_health_ok ""
+  [ "$status" -ne 0 ]
+}
+
+@test "service_health_ok: empty-array string is rejected" {
+  run service_health_ok "[]"
+  [ "$status" -ne 0 ]
+}

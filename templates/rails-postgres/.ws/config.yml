@@ -28,4 +28,7 @@ secrets_file: .env
 # First-run DB setup runs db-init.sh; `ws db-restore` re-runs restore_command.
 # Delete this whole block for an app with no database.
 db:
+  # restore_command is a shell command line, run via `sh -c` inside the app
+  # container — so quoting, pipelines, and env-prefixes are preserved (e.g.
+  # `RAILS_ENV=development bundle exec rake db:reset` works as written).
   restore_command: /usr/local/bin/db-init.sh

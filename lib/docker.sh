@@ -19,11 +19,23 @@ generate_compose() {
   fi
 
   local output="$worktree_path/docker-compose.yml"
+
+  # Escape characters that are special on the REPLACEMENT side of sed's s|…|…|:
+  # the delimiter (|), the whole-match backreference (&), and backslash (\).
+  # Without this, a path containing any of them mis-substitutes or errors —
+  # e.g. a repo cloned under a directory whose name contains '&'.
+  local sed_esc='s/[&|\\]/\\&/g'
+  local wt_e rr_e port_e init_e
+  wt_e=$(printf '%s' "$worktree_path" | sed "$sed_esc")
+  rr_e=$(printf '%s' "$REPO_ROOT"     | sed "$sed_esc")
+  port_e=$(printf '%s' "$host_port"   | sed "$sed_esc")
+  init_e=$(printf '%s' "$db_init"     | sed "$sed_esc")
+
   sed \
-    -e "s|__WORKTREE_PATH__|${worktree_path}|g" \
-    -e "s|__REPO_ROOT__|${REPO_ROOT}|g" \
-    -e "s|__HOST_PORT__|${host_port}|g" \
-    -e "s|__DB_INIT__|${db_init}|g" \
+    -e "s|__WORKTREE_PATH__|${wt_e}|g" \
+    -e "s|__REPO_ROOT__|${rr_e}|g" \
+    -e "s|__HOST_PORT__|${port_e}|g" \
+    -e "s|__DB_INIT__|${init_e}|g" \
     "$template" > "$output"
 }
 
@@ -49,6 +61,29 @@ compose_status() {
     echo "stopped"; return 0
   fi
   echo "none"
+}
+
+# Decide, from a single `docker compose ps --format json` object (one service),
+# whether that service is up AND healthy enough to run work against.
+#
+# Pure helper (no docker call) so it is unit-testable: feed it one NDJSON line.
+# Accept when State is "running" AND Health is empty (no healthcheck declared)
+# or "healthy". Reject "starting"/"unhealthy" (and any non-running State).
+service_health_ok() {
+  local json="$1" state health
+  [[ -z "$json" || "$json" == "[]" ]] && return 1
+  state=$(printf '%s' "$json"  | jq -r '.State  // empty' 2>/dev/null)
+  health=$(printf '%s' "$json" | jq -r '.Health // empty' 2>/dev/null)
+  [[ "$state" == "running" ]] || return 1
+  [[ -z "$health" || "$health" == "healthy" ]]
+}
+
+# True if a specific service in a compose project has a running, healthy
+# container. Mirrors compose_status's NDJSON `head -1` handling.
+service_healthy() {
+  local project="$1" service="$2" line
+  line=$(docker compose -p "$project" ps "$service" --format json 2>/dev/null | head -1)
+  service_health_ok "$line"
 }
 
 # True if any named volume for this project exists (generic "has run before"

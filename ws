@@ -144,7 +144,15 @@ registry_end() {
 
 registry_prune() {
   local cutoff tmp
-  cutoff=$(date -v-30d +"%Y-%m-%d" 2>/dev/null || date -d "30 days ago" +"%Y-%m-%d")
+  cutoff=$(date -v-30d +"%Y-%m-%d" 2>/dev/null || date -d "30 days ago" +"%Y-%m-%d" 2>/dev/null) || true
+  # On a host where neither date form works, cutoff is empty. Running jq with an
+  # empty cutoff makes `.started > ""` true for every entry by accident — undefined
+  # behavior. Fail safe: keep all entries (no data loss) and let a later attach on
+  # a healthy host prune normally.
+  if [[ -z "$cutoff" ]]; then
+    warn "registry_prune: could not compute a 30-day cutoff (no compatible 'date') — skipping prune."
+    return 0
+  fi
   tmp=$(mktemp)
   jq --arg c "$cutoff" \
      '[.[] | select(.status == "active" or .started > $c)]' \
@@ -813,15 +821,31 @@ cmd_db_restore() {
     [[ -z "$branch" ]] && { error "Not in a session directory. Use --branch <name>."; exit 1; }
   fi
 
-  local repo_slug dir_name project worktree_path app_service restore_cmd
+  local repo_slug dir_name project worktree_path app_service db_service restore_cmd
   repo_slug=$(slugify "$REPO"); dir_name=$(slugify "$branch")
   project=$(compose_project_name "$repo_slug" "$dir_name")
   worktree_path="$SESSIONS_DIR/$REPO/$dir_name"
   app_service=$(cfg_default '.compose.app_service' 'app')
+  db_service=$(cfg_default '.compose.db_service' 'db')
   restore_cmd=$(cfg '.db.restore_command')
+
+  # An empty restore_command would make `sh -c ""` a silent no-op that still
+  # reports success — refuse rather than pretend the database was reset.
+  if [[ -z "$restore_cmd" ]]; then
+    error "db.restore_command is empty in .ws/config.yml — nothing to run."; exit 1
+  fi
 
   if [[ "$(compose_status "$project")" != "running" ]]; then
     error "Containers not running for '$branch'. Run 'ws attach --branch $branch' first."; exit 1
+  fi
+
+  # The restore command typically waits on the db (e.g. pg_isready) with NO
+  # timeout, so a down/unhealthy db turns the restore into a silent hang. Assert
+  # the db service is up and healthy first, with an actionable error.
+  if ! service_healthy "$project" "$db_service"; then
+    error "Database service '$db_service' is not running and healthy for '$branch'."
+    error "Bring the session up first: ws attach --branch $branch"
+    exit 1
   fi
 
   warn "This will reset the session database via: $restore_cmd"
@@ -833,9 +857,44 @@ cmd_db_restore() {
   fi
 
   info "Restoring database..."
+  # restore_command is a shell command line (not an argv): run it through one
+  # shell inside the container so quoting / pipelines / env-prefixes survive.
+  # sh is guaranteed present; a login shell (bash -lc) would be the wrong model.
   # set -e propagates a non-zero exit straight out of ws.
-  docker compose -p "$project" -f "$worktree_path/docker-compose.yml" exec "$app_service" $restore_cmd
+  docker compose -p "$project" -f "$worktree_path/docker-compose.yml" exec "$app_service" sh -c "$restore_cmd"
   success "Database restore complete"
+}
+
+# ─── ws update ────────────────────────────────────────────────────────────────
+
+cmd_update() {
+  header "Updating boxwood"
+
+  # SCRIPT_DIR is the real install dir (symlinks already resolved at the top).
+  if ! git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+    error "$SCRIPT_DIR is not a git checkout — cannot self-update."
+    error "Reinstall or update boxwood manually."
+    exit 1
+  fi
+
+  local branch
+  branch=$(git -C "$SCRIPT_DIR" symbolic-ref --short HEAD 2>/dev/null || echo "DETACHED")
+
+  # Refuse to pull onto a dirty tree: --ff-only would still complain, but a clear
+  # up-front message beats a cryptic git error, and protects local edits.
+  if [[ -n "$(git -C "$SCRIPT_DIR" status --porcelain 2>/dev/null)" ]]; then
+    error "working tree dirty — commit/stash in $SCRIPT_DIR first (branch: $branch)."
+    exit 1
+  fi
+
+  info "Pulling latest on '$branch' in $SCRIPT_DIR..."
+  if git -C "$SCRIPT_DIR" pull --ff-only; then
+    success "boxwood updated (branch: $branch)."
+  else
+    error "Update failed on '$branch' (not a fast-forward, or diverged from upstream)."
+    error "Resolve manually: git -C $SCRIPT_DIR pull"
+    exit 1
+  fi
 }
 
 # ─── Usage ────────────────────────────────────────────────────────────────────
@@ -854,6 +913,7 @@ ${BOLD}Usage:${NC}
   ws rebuild                               Build/refresh this repo's base image
   ws exec <command>                        Run a command in the session container
   ws db-restore [--branch <name>] [--yes]  Re-run the repo's DB setup
+  ws update                                Update boxwood itself (git pull --ff-only)
 
 ${BOLD}Flags:${NC}
   --reset      (attach) Drop an existing session DB volume and re-initialize.
@@ -890,6 +950,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     rebuild)    cmd_rebuild ;;
     exec)       shift; cmd_exec "$@" ;;
     db-restore) shift; cmd_db_restore "$@" ;;
+    update)     cmd_update ;;
     -h|--help|help) usage ;;
     *)          usage ;;
   esac
