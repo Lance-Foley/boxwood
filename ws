@@ -30,14 +30,14 @@ slugify() {
 }
 
 registry_add() {
-  local branch="$1" db="$2" port="$3" path="$4" pr="${5:-null}"
+  local branch="$1" project="$2" port="$3" path="$4" pr="${5:-null}"
   local now
   now=$(date +"%Y-%m-%d %H:%M")
   local tmp
   tmp=$(mktemp)
-  jq --arg b "$branch" --arg d "$db" --argjson p "$port" \
+  jq --arg b "$branch" --arg pj "$project" --argjson p "$port" \
      --arg pt "$path" --argjson pr "$pr" --arg s "$now" \
-     '. + [{branch:$b, db:$d, port:$p, path:$pt, pr:$pr, started:$s, status:"active"}]' \
+     '. + [{branch:$b, project:$pj, port:$p, path:$pt, pr:$pr, started:$s, status:"active"}]' \
      "$SESSIONS_FILE" > "$tmp" && mv "$tmp" "$SESSIONS_FILE"
 }
 
@@ -76,7 +76,7 @@ next_port() {
 find_session_by_cwd() {
   local cwd="$1"
   jq -r --arg cwd "$cwd" '
-    .[] | select(.status == "active" and ((.path // .worktree_path // "") as $p | $p != "" and ($cwd | startswith($p)))) | .branch
+    .[] | select(.status == "active" and ((.path // "") as $p | $p != "" and ($cwd | startswith($p)))) | .branch
   ' "$SESSIONS_FILE" | head -1
 }
 
@@ -128,41 +128,74 @@ EOF
 }
 
 launch_tmux() {
-  local session_name="$1" worktree_path="$2" project="$3"
+  local session_name="$1" worktree_path="$2" project="$3" port="$4" pr_number="$5"
+
+  # Include port in session name for visibility in tmux status bar
+  local full_session="${session_name}_${port}"
+
+  # Set Ghostty tab title: "PR #166 — localhost:3000" or "localhost:3000"
+  local tab_title="localhost:${port}"
+  if [[ -n "$pr_number" && "$pr_number" != "null" ]]; then
+    tab_title="PR #${pr_number} — localhost:${port}"
+  fi
+  printf '\033]0;%s\007' "$tab_title"
 
   # Open RubyMine
   open -a "RubyMine" "$worktree_path" 2>/dev/null &
 
   # Resume existing tmux session if it exists
-  if tmux has-session -t "$session_name" 2>/dev/null; then
-    info "Reattaching to tmux session: $session_name"
+  if tmux has-session -t "$full_session" 2>/dev/null; then
+    info "Reattaching to tmux session: $full_session"
     if [[ -n "${TMUX:-}" ]]; then
-      exec tmux switch-client -t "$session_name"
+      exec tmux switch-client -t "$full_session"
     else
-      exec tmux attach -t "$session_name"
+      exec tmux attach -t "$full_session"
     fi
   fi
 
-  # Create tmux session with split panes
-  info "Starting tmux session: $session_name"
-  tmux new-session -d -s "$session_name" -c "$worktree_path"
+  # ┌──────────────┬──────────────┐
+  # │  Neovim      │  Claude Code │
+  # │  (2/3 height)│  (2/3 height)│
+  # ├──────────────┼──────────────┤
+  # │  App logs    │  Container   │
+  # │  (1/3 height)│  Shell       │
+  # └──────────────┴──────────────┘
+  # The dev server runs as the app container's own command (see docs/adr/0001),
+  # so the bottom-left pane just tails its logs rather than launching bin/dev.
+  info "Starting tmux session: $full_session"
+  tmux new-session -d -s "$full_session" -c "$worktree_path"
 
-  # Pane 0 (top-left): shell inside container, auto-starts bin/dev
-  tmux send-keys -t "$session_name" "docker compose -p $project -f $worktree_path/docker-compose.yml exec app bash -c 'bin/dev'" Enter
+  # Source ws tmux config
+  tmux source-file "$SCRIPT_DIR/tmux.conf" 2>/dev/null || true
 
-  # Pane 1 (right): Claude Code on host
-  tmux split-window -h -t "$session_name" -c "$worktree_path"
-  tmux send-keys -t "$session_name" "claude --dangerously-skip-permissions" Enter
+  # Use stable pane IDs (%N) — tmux renumbers indices spatially after splits,
+  # but pane IDs remain stable across all operations.
+  local pane_nvim pane_dev pane_claude pane_shell
 
-  # Pane 2 (bottom-left): shell inside the app container for rails c, rake, etc.
-  tmux select-pane -t "$session_name:.0"
-  tmux split-window -v -t "$session_name" -c "$worktree_path" -l 30%
-  tmux send-keys -t "$session_name" "docker compose -p $project -f $worktree_path/docker-compose.yml exec app bash" Enter
+  pane_nvim=$(tmux display-message -t "$full_session" -p '#{pane_id}')
+
+  # Split into top (67%) and bottom (33%) — full-width horizontal divider
+  pane_dev=$(tmux split-window -v -t "$pane_nvim" -c "$worktree_path" -l 33% -P -F '#{pane_id}')
+
+  # Split top row: neovim (left) + claude (right)
+  pane_claude=$(tmux split-window -h -t "$pane_nvim" -c "$worktree_path" -P -F '#{pane_id}')
+
+  # Split bottom row: dev server (left) + container shell (right)
+  pane_shell=$(tmux split-window -h -t "$pane_dev" -c "$worktree_path" -P -F '#{pane_id}')
+
+  # Send commands using stable pane IDs
+  tmux send-keys -t "$pane_nvim" "nvim ." Enter
+  tmux send-keys -t "$pane_claude" "claude --dangerously-skip-permissions" Enter
+  tmux send-keys -t "$pane_dev" "docker compose -p $project -f $worktree_path/docker-compose.yml logs -f app" Enter
+  tmux send-keys -t "$pane_shell" "docker compose -p $project -f $worktree_path/docker-compose.yml exec app bash" Enter
+
+  # Focus on neovim pane
+  tmux select-pane -t "$pane_nvim"
 
   if [[ -n "${TMUX:-}" ]]; then
-    exec tmux switch-client -t "$session_name"
+    exec tmux switch-client -t "$full_session"
   else
-    exec tmux attach -t "$session_name"
+    exec tmux attach -t "$full_session"
   fi
 }
 
@@ -267,11 +300,14 @@ cmd_attach() {
       fi
     fi
 
-    # Get port from registry or assign new
+    # Get port and PR from registry or assign new
     local port
     port=$(jq -r --arg b "$branch" '.[] | select(.branch == $b and .status == "active") | .port' "$SESSIONS_FILE" | head -1)
     if [[ -z "$port" || "$port" == "null" ]]; then
       port=$(next_port) || exit 1
+    fi
+    if [[ -z "$pr_number" ]]; then
+      pr_number=$(jq -r --arg b "$branch" '.[] | select(.branch == $b and .status == "active") | .pr // empty' "$SESSIONS_FILE" | head -1)
     fi
 
     # Setup worktree if .env missing (first time or clean worktree)
@@ -300,10 +336,10 @@ cmd_attach() {
     local in_registry
     in_registry=$(jq -r --arg b "$branch" '.[] | select(.branch == $b and .status == "active") | .branch' "$SESSIONS_FILE" | head -1)
     if [[ -z "$in_registry" ]]; then
-      registry_add "$branch" "docker:$project" "$port" "$worktree_path" "${pr_number:-null}"
+      registry_add "$branch" "$project" "$port" "$worktree_path" "${pr_number:-null}"
     fi
 
-    launch_tmux "$tmux_session" "$worktree_path" "$project"
+    launch_tmux "$tmux_session" "$worktree_path" "$project" "$port" "${pr_number:-}"
     exit 0
   fi
 
@@ -343,7 +379,7 @@ cmd_attach() {
 
   setup_worktree "$worktree_path" "$branch" "$port" "${pr_number:-}"
   compose_up "$project" "$worktree_path" "$port" "first_run"
-  registry_add "$branch" "docker:$project" "$port" "$worktree_path" "${pr_number:-null}"
+  registry_add "$branch" "$project" "$port" "$worktree_path" "${pr_number:-null}"
 
   header "Session Ready"
   echo -e "  ${BOLD}Branch:${NC}    $branch"
@@ -352,7 +388,7 @@ cmd_attach() {
   echo -e "  ${BOLD}Containers:${NC} docker compose -p $project ps"
   echo ""
 
-  launch_tmux "$tmux_session" "$worktree_path" "$project"
+  launch_tmux "$tmux_session" "$worktree_path" "$project" "$port" "${pr_number:-}"
 }
 
 # ─── ws list ────────────────────────────────────────────────────────────────
@@ -370,18 +406,19 @@ cmd_list() {
     return
   fi
 
-  printf "  ${BOLD}%-30s %-6s %-15s %s${NC}\n" "BRANCH" "PORT" "CONTAINERS" "STARTED"
-  echo "  $(printf '%.0s─' {1..75})"
+  printf "  ${BOLD}%-26s %-5s %-24s %-13s %s${NC}\n" "BRANCH" "PR" "URL" "CONTAINERS" "STARTED"
+  echo "  $(printf '%.0s─' {1..82})"
 
-  echo "$active" | jq -r '.[] | "\(.branch)\t\(.port // "?")\t\(.started)"' |
-  while IFS=$'\t' read -r branch port started; do
+  echo "$active" | jq -r '.[] | "\(.branch)\t\(.port // "?")\t\(.pr // "")\t\(.started)"' |
+  while IFS=$'\t' read -r branch port pr started; do
     local dir_name
     dir_name=$(slugify "$branch")
     local project
     project=$(compose_project_name "$dir_name")
     local status
     status=$(compose_status_display "$project")
-    printf "  %-30s %-6s %-15b %s\n" "${branch:0:28}" "$port" "$status" "$started"
+    local pr_disp="${pr:+#$pr}"
+    printf "  %-26s %-5s %-24s %-13b %s\n" "${branch:0:24}" "$pr_disp" "http://localhost:$port" "$status" "$started"
   done
 }
 
@@ -416,6 +453,8 @@ cmd_end() {
 
   local worktree_path
   worktree_path=$(echo "$session" | jq -r '.path')
+  local port
+  port=$(echo "$session" | jq -r '.port')
 
   local dir_name
   dir_name=$(slugify "$branch")
@@ -466,9 +505,12 @@ cmd_end() {
   registry_end "$branch"
   success "Session ended: $branch"
 
-  # Kill tmux session
-  local tmux_session="ws-$dir_name"
-  tmux kill-session -t "$tmux_session" 2>/dev/null && success "Tmux session killed" || true
+  # Kill tmux session (try new name format first, fall back to old)
+  local tmux_session="ws-${dir_name}_${port}"
+  tmux kill-session -t "$tmux_session" 2>/dev/null \
+    || tmux kill-session -t "ws-$dir_name" 2>/dev/null \
+    || true
+  success "Tmux session killed"
 }
 
 # ─── ws rebuild ─────────────────────────────────────────────────────────────
@@ -496,9 +538,10 @@ cmd_rebuild() {
   git -C "$WESCOM_APP_PATH" show origin/main:package.json > "$build_ctx/package.json"
   git -C "$WESCOM_APP_PATH" show origin/main:yarn.lock > "$build_ctx/yarn.lock"
 
-  # Copy Dockerfile and entrypoint from ws repo
+  # Copy Dockerfile, entrypoint, and DB-init script from ws repo
   cp "$SCRIPT_DIR/Dockerfile" "$build_ctx/"
   cp "$SCRIPT_DIR/docker-entrypoint.sh" "$build_ctx/"
+  cp "$SCRIPT_DIR/db-init.sh" "$build_ctx/"
 
   info "Building image (this may take a few minutes on first run)..."
   docker build -t wescomapp-dev:latest "$build_ctx"
@@ -506,6 +549,60 @@ cmd_rebuild() {
   local size
   size=$(docker image inspect wescomapp-dev:latest --format '{{.Size}}' | awk '{printf "%.0f MB", $1/1024/1024}')
   success "Image built: wescomapp-dev:latest ($size)"
+}
+
+# ─── ws db-restore ───────────────────────────────────────────────────────────
+
+cmd_db_restore() {
+  local branch=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --branch) branch="$2"; shift 2 ;;
+      -*)       error "Unknown option: $1"; exit 1 ;;
+      *)        branch="$1"; shift ;;
+    esac
+  done
+
+  # Detect from cwd if no branch specified
+  if [[ -z "$branch" ]]; then
+    branch=$(find_session_by_cwd "$(pwd)")
+    if [[ -z "$branch" ]]; then
+      error "Not in a session directory. Use --branch <name> or cd to a worktree."
+      exit 1
+    fi
+  fi
+
+  local dir_name
+  dir_name=$(slugify "$branch")
+  local project
+  project=$(compose_project_name "$dir_name")
+  local worktree_path="$SESSIONS_DIR/$dir_name"
+
+  # Check containers are running
+  local status
+  status=$(compose_status "$project")
+  if [[ "$status" != "running" ]]; then
+    error "Containers not running for session '$branch'. Run 'ws attach --branch $branch' first."
+    exit 1
+  fi
+
+  # Check latest.dump exists
+  if [[ ! -f "$WESCOM_APP_PATH/latest.dump" ]]; then
+    error "No latest.dump found at $WESCOM_APP_PATH/latest.dump"
+    exit 1
+  fi
+
+  warn "This will DROP all data and restore the database from latest.dump."
+  if ! confirm "Continue?"; then
+    exit 0
+  fi
+
+  info "Restoring database from latest.dump..."
+  # Reuse the same script the entrypoint runs on first-run init (single source of
+  # truth). set -e propagates a non-zero exit straight out of ws.
+  docker compose -p "$project" -f "$worktree_path/docker-compose.yml" exec app /usr/local/bin/db-init.sh
+  success "Database restore complete"
 }
 
 # ─── ws exec ────────────────────────────────────────────────────────────────
@@ -554,6 +651,7 @@ ${BOLD}Usage:${NC}
   ws end [--branch <name>]           Clean up a session
   ws rebuild                         Rebuild the base Docker image
   ws exec <command>                  Run command in session container
+  ws db-restore [--branch <name>]   Restore database from latest.dump
 
 ${BOLD}Environment:${NC}
   WESCOM_APP_PATH    Path to WescomApp repo (default: ~/code/WescomApp)
@@ -570,7 +668,8 @@ case "${1:-}" in
   list)    cmd_list ;;
   end)     shift; cmd_end "$@" ;;
   rebuild) cmd_rebuild ;;
-  exec)    shift; cmd_exec "$@" ;;
+  exec)       shift; cmd_exec "$@" ;;
+  db-restore) shift; cmd_db_restore "$@" ;;
   -h|--help|help) usage ;;
   *)       usage ;;
 esac

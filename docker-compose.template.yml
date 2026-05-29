@@ -14,7 +14,8 @@ services:
 
   app:
     image: wescomapp-dev:latest
-    command: sleep infinity
+    # No `command:` override — the image CMD (foreman -f Procfile.dev) runs the dev
+    # server, so it self-heals on restart/crash. See docs/adr/0001.
     environment:
       DATABASE_URL: postgres://postgres@db/wescomapp
       SOLID_QUEUE_IN_PUMA: "false"
@@ -35,6 +36,12 @@ services:
       - __WORKTREE_PATH__/.env
     stdin_open: true
     tty: true
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/.db_initialized || test \"$DB_INIT\" != 'true'"]
+      interval: 2s
+      timeout: 5s
+      retries: 150
+      start_period: 5s
 
   worker:
     image: wescomapp-dev:latest
@@ -42,12 +49,14 @@ services:
     environment:
       DATABASE_URL: postgres://postgres@db/wescomapp
       SOLID_QUEUE_IN_PUMA: "false"
+      # Skip dependency reconciliation in the entrypoint (app already did it).
+      WS_ROLE: worker
     volumes:
       - __WORKTREE_PATH__:/app
       - bundle_cache:/usr/local/bundle
     depends_on:
       app:
-        condition: service_started
+        condition: service_healthy
       db:
         condition: service_healthy
     env_file:

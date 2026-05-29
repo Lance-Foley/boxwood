@@ -35,9 +35,10 @@ RUN yarn install --frozen-lockfile
 # Install foreman (used by bin/dev to run Procfile.dev: web + css)
 RUN gem install foreman
 
-# Entrypoint handles dependency drift and DB init
-COPY docker-entrypoint.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+# Entrypoint handles dependency drift and DB init; db-init.sh is the shared
+# DB setup script (also invoked by `ws db-restore`).
+COPY docker-entrypoint.sh db-init.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh /usr/local/bin/db-init.sh
 ENTRYPOINT ["docker-entrypoint.sh"]
 
 # Default: run the dev server via foreman (Puma + Tailwind watcher)
