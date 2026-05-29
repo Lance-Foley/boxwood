@@ -7,6 +7,10 @@
 #
 # Runs inside the app container (has pg client tools + the app bundle).
 #
+# NOTE: baked into the golden base image at build time — the .ws/Dockerfile COPYs
+# this file into /usr/local/bin/, so a running container holds a frozen copy.
+# Editing this file has no effect on a running session until you `ws rebuild`.
+#
 # This starter uses `rails db:prepare` (create + load schema + seed). If your app
 # bootstraps from a production dump instead, replace the body with a pg_restore
 # flow — see the README's "DB from a production dump" note.

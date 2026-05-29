@@ -1,6 +1,12 @@
 #!/bin/bash
 set -e
 
+# NOTE: baked into the golden base image at build time — the .ws/Dockerfile COPYs
+# this file into /usr/local/bin/, so a running container holds a frozen copy.
+# Editing this file has no effect on a running session until you `ws rebuild`.
+# (docker-compose.template.yml, by contrast, is regenerated each attach — but from
+# the main checkout, so worktree-local template edits also no-op.)
+
 # The worker container only runs background jobs and starts after the app is
 # healthy — by which point the app has reconciled any dependency drift into the
 # session's shared bundle_cache. So skip reconciliation entirely on the worker.

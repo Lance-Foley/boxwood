@@ -56,7 +56,11 @@ _Avoid_: session file, database (the registry is not the DB)
 **Golden base image**:
 A Project's dev base image (e.g. `wescomapp-dev:latest`), built by `ws rebuild` from the
 Project's `.ws/Dockerfile` using lockfiles pulled from its `main_branch`. Dependencies
-are baked in; app code, DB data, and secrets are not.
+are baked in; app code, DB data, and secrets are not. The `.ws/` `docker-entrypoint.sh`
+and `db-init.sh` are `COPY`d in too, so edits to them take effect only after `ws rebuild`
+— unlike `docker-compose.template.yml`, which is regenerated each attach from the main
+checkout (so a template edit must live in the main checkout, not a session worktree),
+and unlike the worktree-mounted app code at `/app`, which is genuinely live.
 _Avoid_: dev image, base container
 
 **Dependency drift**:
