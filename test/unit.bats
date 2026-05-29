@@ -130,6 +130,32 @@ JSON
   [ "$branches" = '["old-active","recent-ended"]' ]
 }
 
+@test "registry_prune: empty cutoff fails safe — warns and retains all entries" {
+  # Force the no-compatible-date path: shadow `date` so it always fails, leaving
+  # cutoff empty. The contract is "keep everything + warn" rather than running jq
+  # with an empty cutoff. (We don't stub date globally on PATH — we shadow the
+  # command for this test's shell only.)
+  date() { return 1; }
+
+  cat > "$REGISTRY" <<'JSON'
+[
+ {"repo":"r","branch":"old-ended","status":"ended","started":"2000-01-01 10:00"},
+ {"repo":"r","branch":"active-one","status":"active","started":"2001-01-01 10:00"}
+]
+JSON
+
+  run registry_prune
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"skipping prune"* ]]
+
+  # Nothing dropped, even the ancient ended entry.
+  local branches
+  branches="$(jq -rc '[.[].branch] | sort' "$REGISTRY")"
+  [ "$branches" = '["active-one","old-ended"]' ]
+
+  unset -f date
+}
+
 # ─── next_port ──────────────────────────────────────────────────────────────
 
 @test "next_port: returns the low end of the range when nothing is used" {
@@ -269,6 +295,30 @@ YML
   mkdir -p "$wt"
   generate_compose "$wt" 4242 false
   grep -q "port: 4242" "$wt/docker-compose.yml"
+}
+
+@test "generate_compose: escapes '&' in worktree path (no sed backref corruption)" {
+  REPO_ROOT="$WS_HOME/repo"
+  mkdir -p "$REPO_ROOT/.ws"
+  export CONFIG_JSON='{}'
+
+  cat > "$REPO_ROOT/.ws/docker-compose.template.yml" <<'YML'
+services:
+  app:
+    build: { context: __REPO_ROOT__ }
+    volumes: ["__WORKTREE_PATH__:/app"]
+YML
+
+  # A path containing '&' (sed's whole-match backreference) — legal on disk.
+  local wt="$WS_HOME/r&d/wt"
+  mkdir -p "$wt"
+  generate_compose "$wt" 3007 true
+
+  local out="$wt/docker-compose.yml"
+  [ -f "$out" ]
+  # The '&' must appear LITERALLY, not expanded to the matched token.
+  grep -qF "$wt:/app" "$out"
+  ! grep -q '__WORKTREE_PATH__' "$out"
 }
 
 # NOTE: the confirm() tests moved to test/colors.bats when confirm() gained a
