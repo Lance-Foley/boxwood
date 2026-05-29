@@ -729,6 +729,38 @@ cmd_db_restore() {
   success "Database restore complete"
 }
 
+# ─── ws update ────────────────────────────────────────────────────────────────
+
+cmd_update() {
+  header "Updating boxwood"
+
+  # SCRIPT_DIR is the real install dir (symlinks already resolved at the top).
+  if ! git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+    error "$SCRIPT_DIR is not a git checkout — cannot self-update."
+    error "Reinstall or update boxwood manually."
+    exit 1
+  fi
+
+  local branch
+  branch=$(git -C "$SCRIPT_DIR" symbolic-ref --short HEAD 2>/dev/null || echo "DETACHED")
+
+  # Refuse to pull onto a dirty tree: --ff-only would still complain, but a clear
+  # up-front message beats a cryptic git error, and protects local edits.
+  if [[ -n "$(git -C "$SCRIPT_DIR" status --porcelain 2>/dev/null)" ]]; then
+    error "working tree dirty — commit/stash in $SCRIPT_DIR first (branch: $branch)."
+    exit 1
+  fi
+
+  info "Pulling latest on '$branch' in $SCRIPT_DIR..."
+  if git -C "$SCRIPT_DIR" pull --ff-only; then
+    success "boxwood updated (branch: $branch)."
+  else
+    error "Update failed on '$branch' (not a fast-forward, or diverged from upstream)."
+    error "Resolve manually: git -C $SCRIPT_DIR pull"
+    exit 1
+  fi
+}
+
 # ─── Usage ────────────────────────────────────────────────────────────────────
 
 usage() {
@@ -745,6 +777,7 @@ ${BOLD}Usage:${NC}
   ws rebuild                               Build/refresh this repo's base image
   ws exec <command>                        Run a command in the session container
   ws db-restore [--branch <name>] [--yes]  Re-run the repo's DB setup
+  ws update                                Update boxwood itself (git pull --ff-only)
 
 ${BOLD}Flags:${NC}
   --reset      (attach) Drop an existing session DB volume and re-initialize.
@@ -773,6 +806,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     rebuild)    cmd_rebuild ;;
     exec)       shift; cmd_exec "$@" ;;
     db-restore) shift; cmd_db_restore "$@" ;;
+    update)     cmd_update ;;
     -h|--help|help) usage ;;
     *)          usage ;;
   esac
