@@ -188,8 +188,10 @@ echo "$EXEC_OUT" | grep -q "hi" || fail "ws exec output missing 'hi' (got: $EXEC
 pass "session listed; exec returned 'hi'"
 
 # ── (h) end ──────────────────────────────────────────────────────────────────────
-step "(h) ws end --branch $BRANCH — teardown"
-( cd "$REPO" && "$WS" end --branch "$BRANCH" ) || fail "ws end failed"
+step "(h) ws end --branch $BRANCH --no-push — teardown"
+# --no-push: smoke repos are remote-less, and under WS_ASSUME_YES the push prompt
+# now auto-NOs anyway; pass it explicitly so teardown never tries to publish.
+( cd "$REPO" && "$WS" end --branch "$BRANCH" --no-push ) || fail "ws end failed"
 [[ "$(project_container_count "$PROJECT")" -eq 0 ]] \
   || fail "compose project $PROJECT still has containers after end"
 [[ ! -d "$WORKTREE" ]] || fail "worktree dir still present after end: $WORKTREE"
@@ -239,7 +241,7 @@ docker volume ls -q --filter "name=^${DB_PROJECT}_" | grep -q . \
   || fail "with-DB: no named volume for $DB_PROJECT (pgdata not created)"
 pass "with-DB first_run: app+db healthy (db-init wait completed), pgdata volume present"
 
-( cd "$DB_REPO" && "$WS" end --branch "$DB_BRANCH" ) || fail "with-DB end failed"
+( cd "$DB_REPO" && "$WS" end --branch "$DB_BRANCH" --no-push ) || fail "with-DB end failed"
 [[ "$(project_container_count "$DB_PROJECT")" -eq 0 ]] || fail "with-DB project still has containers"
 [[ ! -d "$DB_WORKTREE" ]] || fail "with-DB worktree still present after end"
 [[ "$(registry_status "$DB_REPO_NAME" "$DB_BRANCH")" == "ended" ]] \

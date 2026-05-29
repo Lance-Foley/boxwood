@@ -90,10 +90,17 @@ compose_up() {
   fi
 
   # After a first run, reset DB_INIT so a later container restart never re-inits.
-  # Rewriting the env recreates the app container (now with DB_INIT=false).
+  # Rewriting the env recreates the app container (now with DB_INIT=false). This
+  # recreate must NOT be silenced: if it fails, the app container is dead and
+  # attaching into it would be a broken session — so fail loudly with logs.
   if [[ "$state" == "first_run" ]]; then
     generate_compose "$worktree_path" "$host_port" "false"
-    docker compose -p "$project" -f "$compose_file" up -d --wait --wait-timeout 120 >/dev/null 2>&1 || true
+    if ! docker compose -p "$project" -f "$compose_file" up -d --wait --wait-timeout 120; then
+      error "Container recreation failed after first-run init (DB_INIT=false)."
+      local app_service; app_service=$(cfg_default '.compose.app_service' 'app')
+      docker compose -p "$project" -f "$compose_file" logs --tail 50 "$app_service" >&2 || true
+      exit 1
+    fi
   fi
 
   success "Containers running on port $host_port"

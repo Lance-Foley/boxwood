@@ -18,14 +18,28 @@ error()   { echo -e "${RED}✗${NC} $*" >&2; }
 header()  { echo -e "\n${BOLD}${CYAN}$*${NC}\n"; }
 dim()     { echo -e "${DIM}$*${NC}"; }
 
+# confirm <prompt> [default]
+#   default 'Y' → benign      (Enter = yes; under WS_ASSUME_YES auto-yes, returns 0)
+#   default 'N' → destructive (Enter = no;  under WS_ASSUME_YES auto-NO,  returns 1)
+#   default omitted → behaves like the original bare [y/N] prompt: empty reply = no,
+#     and under WS_ASSUME_YES it auto-NOs (fail-safe).
+# Under WS_ASSUME_YES the chosen answer is ALWAYS echoed ("y (auto)" / "n (auto)")
+# so headless logs show what happened, and `read` is never reached (no hang).
 confirm() {
   local prompt="${1:-Continue?}"
-  echo -en "${YELLOW}${prompt} [y/N]${NC} "
+  local default="${2:-N}"
+  local hint="[y/N]"; [[ "$default" =~ ^[Yy]$ ]] && hint="[Y/n]"
+  echo -en "${YELLOW}${prompt} ${hint}${NC} "
   if [[ -n "${WS_ASSUME_YES:-}" ]]; then
-    echo ""
-    return 0
+    if [[ "$default" =~ ^[Yy]$ ]]; then
+      echo "y (auto)"; return 0
+    else
+      echo "n (auto)"; return 1
+    fi
   fi
+  local reply
   read -r reply
+  [[ -z "$reply" ]] && reply="$default"
   [[ "$reply" =~ ^[Yy]$ ]]
 }
 

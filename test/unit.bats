@@ -271,24 +271,5 @@ YML
   grep -q "port: 4242" "$wt/docker-compose.yml"
 }
 
-# ─── confirm (WS_ASSUME_YES) ───────────────────────────────────────────────────
-
-@test "confirm: WS_ASSUME_YES returns 0 with no input read" {
-  # confirm is already defined in this sourced shell. Closing stdin proves it
-  # never blocks on read when WS_ASSUME_YES is set.
-  export WS_ASSUME_YES=1
-  run confirm "Proceed?" </dev/null
-  [ "$status" -eq 0 ]
-}
-
-@test "confirm: a 'y' answer returns 0 without WS_ASSUME_YES" {
-  unset WS_ASSUME_YES
-  run bash -c "export WS_HOME='$WS_HOME'; unset WS_ASSUME_YES; source '$WS_BIN'; echo y | confirm 'Proceed?'"
-  [ "$status" -eq 0 ]
-}
-
-@test "confirm: a non-yes answer returns nonzero" {
-  unset WS_ASSUME_YES
-  run bash -c "export WS_HOME='$WS_HOME'; unset WS_ASSUME_YES; source '$WS_BIN'; echo n | confirm 'Proceed?'"
-  [ "$status" -ne 0 ]
-}
+# NOTE: the confirm() tests moved to test/colors.bats when confirm() gained a
+# destructive-aware default ('Y' benign / 'N' destructive). See that file.
