@@ -390,15 +390,39 @@ cmd_init() {
 
 # ─── ws attach ────────────────────────────────────────────────────────────────
 
+# Resolve a bare `ws attach <target>` into a concrete mode + value, given whether
+# the raw name and its slug already exist as a branch/worktree. "Figure it out":
+# resume an existing session by branch; otherwise create a new one. Pure (the
+# existence facts are passed in) so it is unit-testable without git/fs.
+#   $1 target      raw positional   $2 slug  slugify(target)
+#   $3 raw_exists  non-empty if a branch/worktree named exactly $target exists
+#   $4 slug_exists non-empty if a branch/worktree named $slug exists
+# Echoes "branch <name>" or "new <target>".
+resolve_attach_target() {
+  local target="$1" slug="$2" raw_exists="$3" slug_exists="$4"
+  if [[ -n "$raw_exists" ]]; then
+    echo "branch $target"
+  elif [[ -n "$slug_exists" ]]; then
+    echo "branch $slug"
+  else
+    echo "new $target"
+  fi
+}
+
 cmd_attach() {
-  local branch="" pr_number="" new_name="" reset=""
+  local branch="" pr_number="" new_name="" reset="" target=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --pr)     pr_number="$2"; shift 2 ;;
       --branch) branch="$2"; shift 2 ;;
       --new)    new_name="$2"; shift 2 ;;
       --reset)  reset=1; shift ;;
-      *)        error "Unknown argument: $1"; usage; exit 1 ;;
+      --*)      error "Unknown flag: $1"; usage; exit 1 ;;
+      *)        # bare positional: a shorthand target (resolved after config)
+                if [[ -n "$target" ]]; then
+                  error "Provide a single session name (got extra: $1)."; usage; exit 1
+                fi
+                target="$1"; shift ;;
     esac
   done
 
@@ -406,12 +430,35 @@ cmd_attach() {
   [[ -n "$pr_number" ]] && modes=$((modes + 1))
   [[ -n "$branch" ]] && modes=$((modes + 1))
   [[ -n "$new_name" ]] && modes=$((modes + 1))
-  if [[ "$modes" -ne 1 ]]; then
-    error "Provide exactly one of --pr, --branch, or --new."
+  if [[ -n "$target" && "$modes" -ne 0 ]]; then
+    error "Don't combine a bare session name with --pr/--branch/--new."
+    usage; exit 1
+  fi
+  if [[ -z "$target" && "$modes" -ne 1 ]]; then
+    error "Provide a session name, or exactly one of --pr, --branch, or --new."
     usage; exit 1
   fi
 
   require_config
+
+  # Resolve a bare `ws attach <name>`: attach to an existing branch/worktree if
+  # one matches (exactly, or by slug), otherwise create it. Done after config so
+  # REPO_ROOT/REPO/SESSIONS_DIR are known for the existence checks.
+  if [[ -n "$target" ]]; then
+    local slug raw_exists="" slug_exists=""
+    slug=$(slugify "$target")
+    branch_or_worktree_exists() {
+      git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$1" \
+        || [[ -d "$SESSIONS_DIR/$REPO/$1" ]]
+    }
+    branch_or_worktree_exists "$target" && raw_exists="yes"
+    branch_or_worktree_exists "$slug"   && slug_exists="yes"
+    local decision; decision=$(resolve_attach_target "$target" "$slug" "$raw_exists" "$slug_exists")
+    case "$decision" in
+      "branch "*) branch="${decision#branch }" ;;
+      "new "*)    new_name="${decision#new }" ;;
+    esac
+  fi
 
   local image_name main_branch
   image_name=$(cfg '.image.name')
@@ -843,6 +890,7 @@ ${BOLD}ws${NC} — boxwood: isolated containerized dev sessions, one per git wor
 
 ${BOLD}Usage:${NC}
   ws init [--template <name>]              Scaffold .ws/ in the current repo
+  ws attach "<name>" [--reset]             Resume <name> if it exists, else create it
   ws attach --pr <number> [--reset]        Attach to an existing PR
   ws attach --branch <name> [--reset]      Attach to an existing branch
   ws attach --new "description" [--reset]  Create a new branch + session
