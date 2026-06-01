@@ -32,14 +32,28 @@ setup() {
 
 # ─── detect_session_state ─────────────────────────────────────────────────────
 # Mapping under test:
-#   running                 -> resume
-#   stopped                 -> restart
-#   none + volumes present  -> restart
-#   none + no volumes       -> first_run
+#   running                          -> resume
+#   running + app_service unhealthy  -> restart   (half-dead stack → repair)
+#   running + app_service healthy    -> resume
+#   stopped                          -> restart
+#   none + volumes present           -> restart
+#   none + no volumes                -> first_run
 
 @test "detect_session_state: running -> resume" {
   export DOCKER_RUNNING=1
   run detect_session_state "ws-repo-feat"
+  [ "$output" = "resume" ]
+}
+
+@test "detect_session_state: running but app_service unhealthy -> restart" {
+  export DOCKER_RUNNING=1 DOCKER_APP_UNHEALTHY=1
+  run detect_session_state "ws-repo-feat" "app"
+  [ "$output" = "restart" ]
+}
+
+@test "detect_session_state: running and app_service healthy -> resume" {
+  export DOCKER_RUNNING=1
+  run detect_session_state "ws-repo-feat" "app"
   [ "$output" = "resume" ]
 }
 
@@ -129,4 +143,53 @@ setup() {
 @test "service_health_ok: empty-array string is rejected" {
   run service_health_ok "[]"
   [ "$status" -ne 0 ]
+}
+
+# ─── compose_up failure is recoverable (returns, does not exit) ─────────────────
+# start_session relies on catching a failed compose_up to escalate. If compose_up
+# `exit`ed, the whole process would die and no escalation could happen.
+
+@test "compose_up: returns non-zero (does not exit the shell) when 'up' fails" {
+  export DOCKER_UP_FAIL=1
+  generate_compose() { :; }   # skip template rendering; we only test the up path
+  # If compose_up exits, the subshell dies before the marker echo prints.
+  out=$( compose_up proj /wt 3000 restart 2>/dev/null; echo "AFTER:$?" )
+  [[ "$out" == *"AFTER:1"* ]]
+}
+
+# ─── start_session escalation ──────────────────────────────────────────────────
+# Drives the orchestration logic with compose_up/compose_down/project_has_volumes
+# overridden, so the branch behavior is observable via emitted markers.
+
+@test "start_session: first compose_up succeeds -> no down, no reinit" {
+  compose_up()         { echo "up:$4"; return 0; }
+  compose_down()       { echo "down"; }
+  project_has_volumes(){ return 0; }
+  run start_session proj /wt 3000 restart app
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"up:restart"* ]]
+  [[ "$output" != *"up:first_run"* ]]
+  [[ "$output" != *"down"* ]]
+}
+
+@test "start_session: restart fails + volumes -> drops volume and reinits first_run" {
+  compose_up()         { echo "up:$4"; [[ "$4" == "first_run" ]] && return 0 || return 1; }
+  compose_down()       { echo "down"; }
+  project_has_volumes(){ return 0; }
+  run start_session proj /wt 3000 restart app
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"up:restart"* ]]
+  [[ "$output" == *"down"* ]]
+  [[ "$output" == *"up:first_run"* ]]
+}
+
+@test "start_session: failure + no volumes -> returns 1, no reinit" {
+  compose_up()         { echo "up:$4"; return 1; }
+  compose_down()       { echo "down"; }
+  project_has_volumes(){ return 1; }
+  run start_session proj /wt 3000 restart app
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"up:restart"* ]]
+  [[ "$output" != *"down"* ]]
+  [[ "$output" != *"up:first_run"* ]]
 }

@@ -475,7 +475,7 @@ cmd_attach() {
   # ── From here the create and resume paths are identical: the Registry decides
   #    the port, and the pgdata volume (not the Registry) decides the DB
   #    lifecycle. A brand-new worktree has no containers/volume, so
-  #    detect_session_state returns first_run and the drop-DB confirm is skipped. ──
+  #    detect_session_state returns first_run and start_session runs a clean init. ──
 
   # Reuse the port already recorded for this session; allocate a NEW one only
   # when none exists. A freshly allocated port is registered atomically under
@@ -497,20 +497,31 @@ cmd_attach() {
   # so a resume never re-appends the session-context block).
   [[ -f "$worktree_path/.env" ]] || setup_worktree "$worktree_path" "$branch" "$port" "${pr_number:-}"
 
+  local app_service
+  app_service=$(cfg_default '.compose.app_service' 'app')
+
+  # A "running" stack whose app container is unhealthy is reported as "restart"
+  # (not "resume"), so a half-dead session gets repaired instead of attached into.
   local state
-  state=$(detect_session_state "$project")
+  state=$(detect_session_state "$project" "$app_service")
+
+  # --reset forces a clean re-init up front (explicit consent): drop the volume
+  # so the start path below runs a fresh first_run.
+  if [[ -n "$reset" && "$state" != "first_run" ]] && project_has_volumes "$project"; then
+    compose_down "$project" "$worktree_path"; state="first_run"
+  fi
+
   if [[ "$state" == "resume" ]]; then
     info "Containers already running"
   else
-    if [[ "$state" != "first_run" ]] && project_has_volumes "$project" && has_db; then
-      # --reset drops outright (explicit consent, no inner prompt). Without it,
-      # this is a DESTRUCTIVE confirm (default N): under WS_ASSUME_YES it
-      # auto-NOs, so a scripted attach PRESERVES the existing database.
-      if [[ -n "$reset" ]] || confirm "Database exists from a previous run. Drop and re-initialize?" N; then
-        compose_down "$project" "$worktree_path"; state="first_run"
-      fi
-    fi
-    compose_up "$project" "$worktree_path" "$port" "$state"
+    # start_session self-heals: a failed restart escalates automatically to
+    # dropping the DB volume and re-initializing (first_run). The branch and
+    # worktree are never touched. If it still can't come up healthy, fail loudly
+    # with the logs compose_up printed — do NOT attach into a dead stack.
+    start_session "$project" "$worktree_path" "$port" "$state" "$app_service" || {
+      error "Could not bring the session up healthy — see the logs above."
+      exit 1
+    }
   fi
 
   # Register a reused-port session that isn't in the registry yet (e.g. a
