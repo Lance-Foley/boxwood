@@ -390,15 +390,39 @@ cmd_init() {
 
 # ─── ws attach ────────────────────────────────────────────────────────────────
 
+# Resolve a bare `ws attach <target>` into a concrete mode + value, given whether
+# the raw name and its slug already exist as a branch/worktree. "Figure it out":
+# resume an existing session by branch; otherwise create a new one. Pure (the
+# existence facts are passed in) so it is unit-testable without git/fs.
+#   $1 target      raw positional   $2 slug  slugify(target)
+#   $3 raw_exists  non-empty if a branch/worktree named exactly $target exists
+#   $4 slug_exists non-empty if a branch/worktree named $slug exists
+# Echoes "branch <name>" or "new <target>".
+resolve_attach_target() {
+  local target="$1" slug="$2" raw_exists="$3" slug_exists="$4"
+  if [[ -n "$raw_exists" ]]; then
+    echo "branch $target"
+  elif [[ -n "$slug_exists" ]]; then
+    echo "branch $slug"
+  else
+    echo "new $target"
+  fi
+}
+
 cmd_attach() {
-  local branch="" pr_number="" new_name="" reset=""
+  local branch="" pr_number="" new_name="" reset="" target=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --pr)     pr_number="$2"; shift 2 ;;
       --branch) branch="$2"; shift 2 ;;
       --new)    new_name="$2"; shift 2 ;;
       --reset)  reset=1; shift ;;
-      *)        error "Unknown argument: $1"; usage; exit 1 ;;
+      --*)      error "Unknown flag: $1"; usage; exit 1 ;;
+      *)        # bare positional: a shorthand target (resolved after config)
+                if [[ -n "$target" ]]; then
+                  error "Provide a single session name (got extra: $1)."; usage; exit 1
+                fi
+                target="$1"; shift ;;
     esac
   done
 
@@ -406,12 +430,35 @@ cmd_attach() {
   [[ -n "$pr_number" ]] && modes=$((modes + 1))
   [[ -n "$branch" ]] && modes=$((modes + 1))
   [[ -n "$new_name" ]] && modes=$((modes + 1))
-  if [[ "$modes" -ne 1 ]]; then
-    error "Provide exactly one of --pr, --branch, or --new."
+  if [[ -n "$target" && "$modes" -ne 0 ]]; then
+    error "Don't combine a bare session name with --pr/--branch/--new."
+    usage; exit 1
+  fi
+  if [[ -z "$target" && "$modes" -ne 1 ]]; then
+    error "Provide a session name, or exactly one of --pr, --branch, or --new."
     usage; exit 1
   fi
 
   require_config
+
+  # Resolve a bare `ws attach <name>`: attach to an existing branch/worktree if
+  # one matches (exactly, or by slug), otherwise create it. Done after config so
+  # REPO_ROOT/REPO/SESSIONS_DIR are known for the existence checks.
+  if [[ -n "$target" ]]; then
+    local slug raw_exists="" slug_exists=""
+    slug=$(slugify "$target")
+    branch_or_worktree_exists() {
+      git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$1" \
+        || [[ -d "$SESSIONS_DIR/$REPO/$1" ]]
+    }
+    branch_or_worktree_exists "$target" && raw_exists="yes"
+    branch_or_worktree_exists "$slug"   && slug_exists="yes"
+    local decision; decision=$(resolve_attach_target "$target" "$slug" "$raw_exists" "$slug_exists")
+    case "$decision" in
+      "branch "*) branch="${decision#branch }" ;;
+      "new "*)    new_name="${decision#new }" ;;
+    esac
+  fi
 
   local image_name main_branch
   image_name=$(cfg '.image.name')
@@ -475,7 +522,7 @@ cmd_attach() {
   # ── From here the create and resume paths are identical: the Registry decides
   #    the port, and the pgdata volume (not the Registry) decides the DB
   #    lifecycle. A brand-new worktree has no containers/volume, so
-  #    detect_session_state returns first_run and the drop-DB confirm is skipped. ──
+  #    detect_session_state returns first_run and start_session runs a clean init. ──
 
   # Reuse the port already recorded for this session; allocate a NEW one only
   # when none exists. A freshly allocated port is registered atomically under
@@ -497,20 +544,31 @@ cmd_attach() {
   # so a resume never re-appends the session-context block).
   [[ -f "$worktree_path/.env" ]] || setup_worktree "$worktree_path" "$branch" "$port" "${pr_number:-}"
 
+  local app_service
+  app_service=$(cfg_default '.compose.app_service' 'app')
+
+  # A "running" stack whose app container is unhealthy is reported as "restart"
+  # (not "resume"), so a half-dead session gets repaired instead of attached into.
   local state
-  state=$(detect_session_state "$project")
+  state=$(detect_session_state "$project" "$app_service")
+
+  # --reset forces a clean re-init up front (explicit consent): drop the volume
+  # so the start path below runs a fresh first_run.
+  if [[ -n "$reset" && "$state" != "first_run" ]] && project_has_volumes "$project"; then
+    compose_down "$project" "$worktree_path"; state="first_run"
+  fi
+
   if [[ "$state" == "resume" ]]; then
     info "Containers already running"
   else
-    if [[ "$state" != "first_run" ]] && project_has_volumes "$project" && has_db; then
-      # --reset drops outright (explicit consent, no inner prompt). Without it,
-      # this is a DESTRUCTIVE confirm (default N): under WS_ASSUME_YES it
-      # auto-NOs, so a scripted attach PRESERVES the existing database.
-      if [[ -n "$reset" ]] || confirm "Database exists from a previous run. Drop and re-initialize?" N; then
-        compose_down "$project" "$worktree_path"; state="first_run"
-      fi
-    fi
-    compose_up "$project" "$worktree_path" "$port" "$state"
+    # start_session self-heals: a failed restart escalates automatically to
+    # dropping the DB volume and re-initializing (first_run). The branch and
+    # worktree are never touched. If it still can't come up healthy, fail loudly
+    # with the logs compose_up printed — do NOT attach into a dead stack.
+    start_session "$project" "$worktree_path" "$port" "$state" "$app_service" || {
+      error "Could not bring the session up healthy — see the logs above."
+      exit 1
+    }
   fi
 
   # Register a reused-port session that isn't in the registry yet (e.g. a
@@ -832,6 +890,7 @@ ${BOLD}ws${NC} — boxwood: isolated containerized dev sessions, one per git wor
 
 ${BOLD}Usage:${NC}
   ws init [--template <name>]              Scaffold .ws/ in the current repo
+  ws attach "<name>" [--reset]             Resume <name> if it exists, else create it
   ws attach --pr <number> [--reset]        Attach to an existing PR
   ws attach --branch <name> [--reset]      Attach to an existing branch
   ws attach --new "description" [--reset]  Create a new branch + session

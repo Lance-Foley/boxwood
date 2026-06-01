@@ -323,3 +323,28 @@ YML
 
 # NOTE: the confirm() tests moved to test/colors.bats when confirm() gained a
 # destructive-aware default ('Y' benign / 'N' destructive). See that file.
+
+# ─── resolve_attach_target ─────────────────────────────────────────────────────
+# Maps a bare `ws attach <target>` to a concrete mode + value, given whether the
+# raw name / its slug already exist as a branch or worktree. "Figure it out":
+# resume an existing session by branch; otherwise create a new one.
+
+@test "resolve_attach_target: raw name already exists -> branch <raw>" {
+  run resolve_attach_target "feature/login" "feature-login" "yes" ""
+  [ "$output" = "branch feature/login" ]
+}
+
+@test "resolve_attach_target: only the slug exists -> branch <slug>" {
+  run resolve_attach_target "Create Mobile View" "create-mobile-view" "" "yes"
+  [ "$output" = "branch create-mobile-view" ]
+}
+
+@test "resolve_attach_target: neither exists -> new <raw>" {
+  run resolve_attach_target "Brand New Thing" "brand-new-thing" "" ""
+  [ "$output" = "new Brand New Thing" ]
+}
+
+@test "resolve_attach_target: raw match wins over slug match" {
+  run resolve_attach_target "exact" "exact" "yes" "yes"
+  [ "$output" = "branch exact" ]
+}

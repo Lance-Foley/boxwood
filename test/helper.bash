@@ -31,14 +31,33 @@ stub_docker() {
 #!/usr/bin/env bash
 # Minimal docker stub for boxwood unit tests.
 if [[ "$1" == "compose" ]]; then
+  # `up` failure injection: DOCKER_UP_FAIL makes `compose up` exit non-zero so a
+  # caller's failure path (return vs exit) can be exercised.
+  is_up=0
+  for a in "$@"; do [[ "$a" == "up" ]] && is_up=1; done
+  [[ "$is_up" == "1" && -n "${DOCKER_UP_FAIL:-}" ]] && exit 1
   # Find whether a status filter is present anywhere in the args.
   has_running_filter=0
   for a in "$@"; do [[ "$a" == "running" ]] && has_running_filter=1; done
-  # Is this a `ps` invocation?
-  is_ps=0
-  for a in "$@"; do [[ "$a" == "ps" ]] && is_ps=1; done
+  # Is this a `ps` invocation, and for a specific service? `compose ps <service>`
+  # (service health) carries a positional token right after `ps`; `compose ps
+  # [--status running] --format json` (whole-project status) carries only flags.
+  is_ps=0; svc=""; prev=""
+  for a in "$@"; do
+    [[ "$a" == "ps" ]] && is_ps=1
+    [[ "$prev" == "ps" && "$a" != -* ]] && svc="$a"
+    prev="$a"
+  done
   if [[ "$is_ps" == "1" ]]; then
-    if [[ "$has_running_filter" == "1" ]]; then
+    if [[ -n "$svc" ]]; then
+      # Service-specific health query. DOCKER_APP_UNHEALTHY marks this service
+      # running-but-unhealthy; otherwise DOCKER_RUNNING means running+healthy.
+      if [[ -n "${DOCKER_APP_UNHEALTHY:-}" ]]; then
+        echo "{\"Name\":\"$svc\",\"State\":\"running\",\"Health\":\"unhealthy\"}"
+      elif [[ -n "${DOCKER_RUNNING:-}" ]]; then
+        echo "{\"Name\":\"$svc\",\"State\":\"running\",\"Health\":\"healthy\"}"
+      fi
+    elif [[ "$has_running_filter" == "1" ]]; then
       [[ -n "${DOCKER_RUNNING:-}" ]] && echo '{"Name":"stub","State":"running"}'
     else
       { [[ -n "${DOCKER_RUNNING:-}" ]] || [[ -n "${DOCKER_ANY:-}" ]]; } && echo '{"Name":"stub","State":"exited"}'

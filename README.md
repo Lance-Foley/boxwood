@@ -110,6 +110,7 @@ not the repo's recipe.
 | Command | What it does |
 |---------|--------------|
 | `ws init [--template <name>]` | Scaffold `.ws/` in the current repo (default template: `rails-postgres`). |
+| `ws attach "<name>"` | Shorthand: resume the session if `<name>` already exists (by branch or slug), otherwise create it. |
 | `ws attach --new "description"` | Create a new branch off `main_branch` + a fresh session. |
 | `ws attach --branch <name>` | Session for an existing branch (resumes if it already exists). |
 | `ws attach --pr <number>` | Resolve the PR's branch via `gh` and start/resume its session. |
@@ -121,7 +122,11 @@ not the repo's recipe.
 | `ws update` | Update boxwood itself (`git pull --ff-only` on the install checkout). |
 
 `attach` is the single entry point: it creates a session the first time and resumes it
-(reattaching tmux, restarting stopped containers) every time after.
+(reattaching tmux, restarting stopped containers) every time after. If it finds a broken
+session — containers up but the app container crashed on boot — it self-heals: it restarts
+the app in place, and if that still won't come up healthy it drops the DB volume and
+re-initializes from scratch. The git branch and worktree are never touched; only if the
+stack still can't come up healthy does it stop and print the logs.
 
 ---
 

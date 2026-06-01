@@ -94,12 +94,24 @@ project_has_volumes() {
 }
 
 # Detect session state: "first_run", "resume", or "restart".
+#
+# A stack is only "resume" if it is safe to attach into as-is. When an
+# app_service is given, a "running" project whose app container is NOT healthy is
+# a half-dead stack (e.g. the worker is up but the app crashed on boot) and is
+# demoted to "restart" so the caller repairs it rather than attaching into a dead
+# app. Called with no app_service, the original status→state mapping is preserved.
 detect_session_state() {
-  local project="$1"
+  local project="$1" app_service="${2:-}"
   local status
   status=$(compose_status "$project")
   case "$status" in
-    running) echo "resume" ;;
+    running)
+      if [[ -n "$app_service" ]] && ! service_healthy "$project" "$app_service"; then
+        echo "restart"
+      else
+        echo "resume"
+      fi
+      ;;
     stopped) echo "restart" ;;
     none)
       if project_has_volumes "$project"; then echo "restart"; else echo "first_run"; fi
@@ -121,7 +133,7 @@ compose_up() {
   if ! docker compose -p "$project" -f "$compose_file" up -d --wait --wait-timeout 600; then
     error "Containers did not become healthy in time."
     error "Check: docker compose -p $project logs"
-    exit 1
+    return 1
   fi
 
   # After a first run, reset DB_INIT so a later container restart never re-inits.
@@ -134,11 +146,39 @@ compose_up() {
       error "Container recreation failed after first-run init (DB_INIT=false)."
       local app_service; app_service=$(cfg_default '.compose.app_service' 'app')
       docker compose -p "$project" -f "$compose_file" logs --tail 50 "$app_service" >&2 || true
-      exit 1
+      return 1
     fi
   fi
 
   success "Containers running on port $host_port"
+}
+
+# Bring a session's stack up, self-healing a broken one. The git branch and
+# worktree are NEVER touched — only containers and the DB volume.
+#
+# Escalation:
+#   1. compose_up with the detected state (restart = DB_INIT false; the app
+#      container is recreated and re-waited, repairing a crashed-on-boot stack).
+#   2. If that fails and a DB volume exists, the data is assumed bad/uninitialized:
+#      drop the volume and re-run a clean first-run init (DB_INIT true).
+#   3. If that also fails (or there was no volume to reset), return non-zero so the
+#      caller errors out with the logs compose_up already printed — no attaching
+#      into a stack that cannot be brought up healthy.
+start_session() {
+  local project="$1" worktree_path="$2" port="$3" state="$4" app_service="$5"
+
+  if compose_up "$project" "$worktree_path" "$port" "$state"; then
+    return 0
+  fi
+
+  if [[ "$state" != "first_run" ]] && project_has_volumes "$project"; then
+    warn "App did not come up healthy — reinitializing DB volume (branch & worktree untouched)."
+    compose_down "$project" "$worktree_path"
+    compose_up "$project" "$worktree_path" "$port" "first_run"
+    return $?
+  fi
+
+  return 1
 }
 
 # Stop and remove a compose stack (including volumes).
